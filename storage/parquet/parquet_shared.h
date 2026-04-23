@@ -5,6 +5,7 @@
 
 #include "duckdb.hpp"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -67,5 +68,11 @@ bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
                                 long *http_code = nullptr);
 std::string fetch_current_snapshot_data_file(
     const parquet::TableMetadata &metadata);
+
+std::mutex &parquet_duckdb_mutex();
+bool parquet_init_shared_duckdb_runtime(std::string *error);
+void parquet_deinit_shared_duckdb_runtime();
+duckdb::Connection *parquet_handler_connection_locked(std::string *error);
+duckdb::Connection *parquet_pushdown_connection_locked(std::string *error);
 
 #endif

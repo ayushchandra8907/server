@@ -3,6 +3,7 @@
 
 #include "ha_parquet.h"
 #include "ha_parquet_pushdown.h"
+#include "parquet_cross_engine_scan.h"
 #include "parquet_metadata.h"
 #include "parquet_object_store.h"
 #include "parquet_shared.h"
@@ -32,6 +33,8 @@ static THR_LOCK parquet_lock;
 static duckdb::DuckDB *g_duckdb = nullptr;
 static std::unordered_map<std::thread::id, std::unique_ptr<duckdb::Connection>>
     g_duckdb_handler_connections;
+static std::unordered_map<std::thread::id, std::unique_ptr<duckdb::Connection>>
+    g_duckdb_pushdown_connections;
 static int ha_parquet_commit(THD *thd, bool all);
 
 struct ha_table_option_struct
@@ -245,7 +248,7 @@ bool parquet_run_duckdb_query(duckdb::Connection *con,
   return true;
 }
 
-bool parquet_bootstrap_extensions_locked(std::string *error)
+bool parquet_bootstrap_extensions_locked_impl(std::string *error)
 {
   if (g_duckdb == nullptr) {
     if (error != nullptr) {
@@ -270,8 +273,8 @@ bool parquet_bootstrap_extensions_locked(std::string *error)
   }
 }
 
-bool parquet_prepare_handler_connection_locked(duckdb::Connection *con,
-                                               std::string *error)
+bool parquet_prepare_connection_locked_impl(duckdb::Connection *con,
+                                            std::string *error)
 {
   return parquet_run_duckdb_query(con, "runtime/load-parquet",
                                   "LOAD parquet;", error) &&
@@ -279,8 +282,18 @@ bool parquet_prepare_handler_connection_locked(duckdb::Connection *con,
                                   "LOAD httpfs;", error);
 }
 
-duckdb::Connection *parquet_handler_connection_locked(std::string *error)
+duckdb::Connection *parquet_cached_connection_locked_impl(
+    std::unordered_map<std::thread::id, std::unique_ptr<duckdb::Connection>>
+        *connection_cache,
+    const char *connection_label, std::string *error)
 {
+  if (connection_cache == nullptr) {
+    if (error != nullptr) {
+      *error = "DuckDB connection cache must not be null";
+    }
+    return nullptr;
+  }
+
   if (g_duckdb == nullptr) {
     if (error != nullptr) {
       *error = "DuckDB runtime is not initialized";
@@ -289,21 +302,21 @@ duckdb::Connection *parquet_handler_connection_locked(std::string *error)
   }
 
   const std::thread::id thread_id = std::this_thread::get_id();
-  auto it = g_duckdb_handler_connections.find(thread_id);
-  if (it != g_duckdb_handler_connections.end()) {
+  auto it = connection_cache->find(thread_id);
+  if (it != connection_cache->end()) {
     return it->second.get();
   }
 
   try {
     std::unique_ptr<duckdb::Connection> con(new duckdb::Connection(*g_duckdb));
-    if (!parquet_prepare_handler_connection_locked(con.get(), error)) {
+    if (!parquet_prepare_connection_locked_impl(con.get(), error)) {
       return nullptr;
     }
 
     duckdb::Connection *raw = con.get();
-    g_duckdb_handler_connections.emplace(thread_id, std::move(con));
-    parquet_log_info(
-        "DuckDB handler connection initialized for current worker thread");
+    connection_cache->emplace(thread_id, std::move(con));
+    parquet_log_info(std::string("DuckDB ") + connection_label +
+                     " connection initialized for current worker thread");
     return raw;
   } catch (const std::exception &e) {
     if (error != nullptr) {
@@ -314,6 +327,58 @@ duckdb::Connection *parquet_handler_connection_locked(std::string *error)
 }
 
 } // namespace
+
+std::mutex &parquet_duckdb_mutex()
+{
+  return g_duckdb_mutex;
+}
+
+bool parquet_init_shared_duckdb_runtime(std::string *error)
+{
+  std::lock_guard<std::mutex> lock(g_duckdb_mutex);
+  if (g_duckdb != nullptr) {
+    return true;
+  }
+
+  try {
+    g_duckdb = new duckdb::DuckDB(nullptr);
+  } catch (const std::exception &e) {
+    if (error != nullptr) {
+      *error = e.what();
+    }
+    return false;
+  }
+
+  if (!parquet_bootstrap_extensions_locked_impl(error)) {
+    delete g_duckdb;
+    g_duckdb = nullptr;
+    return false;
+  }
+
+  myparquet::register_cross_engine_scan(*g_duckdb->instance);
+  return true;
+}
+
+void parquet_deinit_shared_duckdb_runtime()
+{
+  std::lock_guard<std::mutex> lock(g_duckdb_mutex);
+  g_duckdb_handler_connections.clear();
+  g_duckdb_pushdown_connections.clear();
+  delete g_duckdb;
+  g_duckdb = nullptr;
+}
+
+duckdb::Connection *parquet_handler_connection_locked(std::string *error)
+{
+  return parquet_cached_connection_locked_impl(&g_duckdb_handler_connections,
+                                               "handler", error);
+}
+
+duckdb::Connection *parquet_pushdown_connection_locked(std::string *error)
+{
+  return parquet_cached_connection_locked_impl(&g_duckdb_pushdown_connections,
+                                               "pushdown", error);
+}
 
 
 ha_parquet::ha_parquet(handlerton *hton, TABLE_SHARE *table_arg) : handler(hton, table_arg)
@@ -1537,20 +1602,7 @@ static int ha_parquet_init(void *p)
  update_s3_secret_access_key(0, 0, 0, 0);
 
  std::string duckdb_error;
- {
-   std::lock_guard<std::mutex> lock(g_duckdb_mutex);
-   try {
-     g_duckdb = new duckdb::DuckDB(nullptr);
-   } catch (const std::exception &e) {
-     duckdb_error = e.what();
-   }
-   if (g_duckdb != nullptr &&
-       !parquet_bootstrap_extensions_locked(&duckdb_error)) {
-     delete g_duckdb;
-     g_duckdb = nullptr;
-   }
- }
- if (g_duckdb == nullptr) {
+ if (!parquet_init_shared_duckdb_runtime(&duckdb_error)) {
    parquet_log_warning("DuckDB runtime initialization failed: " + duckdb_error);
    parquet_hton = 0;
    thr_lock_delete(&parquet_lock);
@@ -1565,10 +1617,7 @@ static int ha_parquet_init(void *p)
 
 static int ha_parquet_deinit(void *p)
 {
- std::lock_guard<std::mutex> lock(g_duckdb_mutex);
- g_duckdb_handler_connections.clear();
- delete g_duckdb;
- g_duckdb = nullptr;
+ parquet_deinit_shared_duckdb_runtime();
  parquet_log_info("DuckDB global instance deinitialized");
  parquet_hton = 0;
  thr_lock_delete(&parquet_lock);

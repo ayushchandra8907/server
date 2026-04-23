@@ -33,8 +33,7 @@ protected:
   int end_scan() override;
 
 private:
-  std::unique_ptr<duckdb::DuckDB> duckdb_db;
-  std::unique_ptr<duckdb::Connection> duckdb_con;
+  duckdb::Connection *duckdb_con;
   std::unique_ptr<duckdb::QueryResult> query_result;
   std::unique_ptr<duckdb::DataChunk> current_chunk;
   size_t current_row_index;
@@ -43,6 +42,7 @@ private:
   StringBuffer<4096> query_string;
   std::vector<TABLE_LIST *> parquet_tables;
   std::vector<TABLE_LIST *> external_tables;
+  std::vector<std::string> temp_view_names;
 };
 
 select_handler *create_duckdb_select_handler(THD *thd,
