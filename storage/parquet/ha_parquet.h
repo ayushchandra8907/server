@@ -12,6 +12,7 @@
 
 
 #include <cstdint>
+#include <memory>
 #include <map>
 #include <vector>
 #include <string>
@@ -27,6 +28,7 @@ struct parquet_table_trx_data {
  std::string table_path;
  std::string statement_buffer_name;
  uint64_t    statement_row_count = 0;
+ std::unique_ptr<duckdb::Appender> statement_appender;
  std::vector<parquet_local_stage_file> staged_files;
  std::vector<std::string> uploaded_s3_file_paths;
 };

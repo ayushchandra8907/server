@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
@@ -542,22 +543,6 @@ static std::string build_copy_to_parquet_query(const std::string &table_name,
         quote_string_literal(parquet_file) + " (FORMAT PARQUET)";
 }
 
-static bool needs_quoting(Field *f)
-{
- switch (f->type()) {
-   case MYSQL_TYPE_VARCHAR: case MYSQL_TYPE_VAR_STRING: case MYSQL_TYPE_STRING:
-   case MYSQL_TYPE_ENUM: case MYSQL_TYPE_SET:
-   case MYSQL_TYPE_TINY_BLOB: case MYSQL_TYPE_MEDIUM_BLOB:
-   case MYSQL_TYPE_LONG_BLOB: case MYSQL_TYPE_BLOB:
-   case MYSQL_TYPE_DATE: case MYSQL_TYPE_NEWDATE:
-   case MYSQL_TYPE_TIME: case MYSQL_TYPE_TIME2:
-   case MYSQL_TYPE_DATETIME: case MYSQL_TYPE_DATETIME2:
-   case MYSQL_TYPE_TIMESTAMP: case MYSQL_TYPE_TIMESTAMP2:
-     return true;
-   default: return false;
- }
-}
-
 static bool parquet_is_real_commit(THD *thd, bool all)
 {
   return ((all || thd->transaction->all.ha_list == 0) &&
@@ -601,14 +586,211 @@ static parquet_table_trx_data *parquet_table_txn_for_share(
   return &table_trx;
 }
 
-static bool parquet_drop_duckdb_table(const std::string &table_name)
+class parquet_field_record_scope
+{
+public:
+  parquet_field_record_scope(Field *field_arg, const uchar *buf)
+      : field(field_arg), saved_ptr(field_arg->ptr)
+  {
+    field->ptr = const_cast<uchar *>(field->ptr_in_record(buf));
+  }
+
+  ~parquet_field_record_scope() { field->ptr = saved_ptr; }
+
+private:
+  Field *field;
+  uchar *saved_ptr;
+};
+
+static bool parquet_close_statement_appender_locked(
+    parquet_table_trx_data *table_trx, std::string *error)
+{
+  if (table_trx == nullptr || !table_trx->statement_appender) {
+    return true;
+  }
+
+  try {
+    table_trx->statement_appender->Flush();
+    table_trx->statement_appender->Close();
+    table_trx->statement_appender.reset();
+    return true;
+  } catch (const std::exception &e) {
+    table_trx->statement_appender.reset();
+    if (error != nullptr) {
+      *error = e.what();
+    }
+    return false;
+  }
+}
+
+static bool parquet_ensure_statement_buffer_table_locked(
+    parquet_table_trx_data *table_trx, TABLE *table, duckdb::Connection *con,
+    std::string *error)
+{
+  if (table_trx == nullptr || table == nullptr || con == nullptr) {
+    if (error != nullptr) {
+      *error = "invalid state while ensuring statement buffer table";
+    }
+    return false;
+  }
+
+  std::string create_sql = build_query_create(table_trx->statement_buffer_name, table);
+  if (create_sql.empty()) {
+    if (error != nullptr) {
+      *error = "unsupported MariaDB column type in Parquet write path";
+    }
+    return false;
+  }
+
+  parquet_log_info("DuckDB query [write/ensure-buffer] " +
+                   parquet_log_preview(create_sql));
+  auto result = con->Query(create_sql);
+  if (!result || result->HasError()) {
+    if (error != nullptr) {
+      *error = result ? result->GetError()
+                      : "DuckDB returned a null result while creating buffer table";
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool parquet_ensure_statement_appender_locked(
+    parquet_table_trx_data *table_trx, TABLE *table, duckdb::Connection *con,
+    std::string *error)
+{
+  if (table_trx == nullptr || table == nullptr || con == nullptr) {
+    if (error != nullptr) {
+      *error = "invalid state while ensuring statement appender";
+    }
+    return false;
+  }
+
+  if (table_trx->statement_appender) {
+    return true;
+  }
+
+  if (!parquet_ensure_statement_buffer_table_locked(table_trx, table, con, error)) {
+    return false;
+  }
+
+  try {
+    table_trx->statement_appender =
+        std::make_unique<duckdb::Appender>(*con, table_trx->statement_buffer_name);
+    parquet_log_info("DuckDB appender ready table='" + table_trx->table_name +
+                     "' buffer='" + table_trx->statement_buffer_name + "'");
+    return true;
+  } catch (const std::exception &e) {
+    if (error != nullptr) {
+      *error = e.what();
+    }
+    return false;
+  }
+}
+
+static duckdb::Value parquet_field_to_duckdb_value(Field *field, const uchar *buf)
+{
+  if (field->is_null_in_record(buf)) {
+    return duckdb::Value();
+  }
+
+  parquet_field_record_scope field_scope(field, buf);
+
+  switch (field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR:
+      if (field->is_unsigned()) {
+        return duckdb::Value::UBIGINT(field->val_uint());
+      }
+      return duckdb::Value::BIGINT(field->val_int());
+
+    case MYSQL_TYPE_FLOAT:
+      return duckdb::Value::FLOAT(static_cast<float>(field->val_real()));
+
+    case MYSQL_TYPE_DOUBLE:
+      return duckdb::Value::DOUBLE(field->val_real());
+
+    case MYSQL_TYPE_BIT:
+      return duckdb::Value::BOOLEAN(field->val_int() != 0);
+
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_TIME2:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+    case MYSQL_TYPE_SET:
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_STRING: {
+      String value;
+      String *result = field->val_str(&value);
+      if (result == nullptr) {
+        return duckdb::Value();
+      }
+      return duckdb::Value(std::string(result->ptr(), result->length()));
+    }
+
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB: {
+      String value;
+      String *result = field->val_str(&value);
+      if (result == nullptr) {
+        return duckdb::Value();
+      }
+      if (field->charset() == &my_charset_bin) {
+        return duckdb::Value::BLOB(
+            reinterpret_cast<duckdb::const_data_ptr_t>(result->ptr()),
+            result->length());
+      }
+      return duckdb::Value(std::string(result->ptr(), result->length()));
+    }
+
+    default:
+      throw std::runtime_error("unsupported MariaDB column type in Parquet appender");
+  }
+}
+
+static bool parquet_append_mysql_field_to_appender(
+    Field *field, const uchar *buf, duckdb::Appender *appender,
+    std::string *error)
+{
+  if (field == nullptr || appender == nullptr) {
+    if (error != nullptr) {
+      *error = "invalid state while appending MariaDB row";
+    }
+    return false;
+  }
+
+  try {
+    appender->Append(parquet_field_to_duckdb_value(field, buf));
+    return true;
+  } catch (const std::exception &e) {
+    if (error != nullptr) {
+      *error = e.what();
+    }
+    return false;
+  }
+}
+
+static bool parquet_drop_duckdb_table_locked(const std::string &table_name)
 {
   if (table_name.empty()) {
     return true;
   }
 
   try {
-    std::lock_guard<std::mutex> lock(g_duckdb_mutex);
     std::string connection_error;
     duckdb::Connection *con =
         parquet_handler_connection_locked(&connection_error);
@@ -635,20 +817,31 @@ static bool parquet_drop_duckdb_table(const std::string &table_name)
   }
 }
 
-static void parquet_reset_statement_buffer(parquet_table_trx_data *table_trx)
+static void parquet_reset_statement_buffer_locked(parquet_table_trx_data *table_trx)
 {
   if (table_trx == nullptr) {
     return;
+  }
+
+  std::string close_error;
+  if (!parquet_close_statement_appender_locked(table_trx, &close_error)) {
+    std::cerr << "DuckDB appender close error: " << close_error << std::endl;
   }
 
   if (!table_trx->statement_buffer_name.empty()) {
     parquet_log_info("Parquet dropping statement buffer table='" +
                      table_trx->table_name + "' buffer='" +
                      table_trx->statement_buffer_name + "'");
-    parquet_drop_duckdb_table(table_trx->statement_buffer_name);
+    parquet_drop_duckdb_table_locked(table_trx->statement_buffer_name);
   }
   table_trx->statement_buffer_name.clear();
   table_trx->statement_row_count = 0;
+}
+
+static void parquet_reset_statement_buffer(parquet_table_trx_data *table_trx)
+{
+  std::lock_guard<std::mutex> lock(g_duckdb_mutex);
+  parquet_reset_statement_buffer_locked(table_trx);
 }
 
 static void parquet_remove_local_stage_files(parquet_table_trx_data *table_trx)
@@ -699,6 +892,9 @@ static bool parquet_stage_statement_buffer_to_local(
     std::lock_guard<std::mutex> lock(g_duckdb_mutex);
     duckdb::Connection *con = parquet_handler_connection_locked(error);
     if (con == nullptr) {
+      return false;
+    }
+    if (!parquet_close_statement_appender_locked(table_trx, error)) {
       return false;
     }
     std::remove(local_stage_path.c_str());
@@ -1102,43 +1298,29 @@ int ha_parquet::write_row(const uchar *buf)
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
-    std::string create_sql =
-        build_query_create(table_trx->statement_buffer_name, table);
-    if (create_sql.empty()) { DBUG_RETURN(HA_ERR_UNSUPPORTED); }
-    parquet_log_info("DuckDB query [write/ensure-buffer] " +
-                     parquet_log_preview(create_sql));
-    con->Query(create_sql);
+    if (!parquet_ensure_statement_appender_locked(table_trx, table, con,
+                                                  &connection_error)) {
+      if (connection_error == "unsupported MariaDB column type in Parquet write path") {
+        DBUG_RETURN(HA_ERR_UNSUPPORTED);
+      }
+      std::cerr << "DuckDB appender init error: " << connection_error
+                << std::endl;
+      parquet_reset_statement_buffer_locked(table_trx);
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
 
-    std::string insert_sql =
-        "INSERT INTO " + table_trx->statement_buffer_name + " VALUES (";
-    bool first_flag = false;
-
+    duckdb::Appender *appender = table_trx->statement_appender.get();
+    appender->BeginRow();
     for (Field **field = table->field; *field; ++field) {
-      Field *f = *field;
-      if (first_flag) insert_sql += ", ";
-      first_flag = true;
-      const bool is_null = f->is_null_in_record(buf);
-      if (is_null) {
-        insert_sql += "NULL";
-      } else {
-        String val;
-        String *res = f->val_str(&val, f->ptr_in_record(buf));
-        std::string val_cpp;
-        if (res != nullptr)
-          val_cpp.assign(res->ptr(), res->length());
-        insert_sql += needs_quoting(f) ? quote_string_literal(val_cpp) : val_cpp;
+      if (!parquet_append_mysql_field_to_appender(*field, buf, appender,
+                                                  &connection_error)) {
+        std::cerr << "DuckDB appender row error: " << connection_error
+                  << std::endl;
+        parquet_reset_statement_buffer_locked(table_trx);
+        DBUG_RETURN(HA_ERR_GENERIC);
       }
     }
-
-    insert_sql += ")";
-    parquet_log_info("DuckDB query [write/insert-buffer-row] " +
-                     parquet_log_preview(insert_sql));
-
-    auto result = con->Query(insert_sql);
-    if (!result || result->HasError()) {
-      std::cerr << "INSERT error: " << (result ? result->GetError() : "null result") << std::endl;
-      DBUG_RETURN(HA_ERR_GENERIC);
-    }
+    appender->EndRow();
 
     table_trx->statement_row_count++;
     parquet_log_info("DuckDB buffered row table='" +
@@ -1147,9 +1329,11 @@ int ha_parquet::write_row(const uchar *buf)
                      std::to_string(table_trx->statement_row_count));
   } catch (const duckdb::Exception &e) {
     std::cerr << "write_row DuckDB exception: " << e.what() << std::endl;
+    parquet_reset_statement_buffer(table_trx);
     DBUG_RETURN(HA_ERR_GENERIC);
   } catch (const std::exception &e) {
     std::cerr << "write_row std exception: " << e.what() << std::endl;
+    parquet_reset_statement_buffer(table_trx);
     DBUG_RETURN(HA_ERR_GENERIC);
   }
 
