@@ -213,6 +213,4 @@ if [[ "$RUN_TEST" -eq 1 ]]; then
 
   echo "==> Smoke test passed"
 fi
-EOF
 
-chmod +x scripts/build_parquet.sh
