@@ -1,3 +1,5 @@
+#parquet  build config 
+
 FIND_PACKAGE(CURL REQUIRED)
 
 if(NOT TARGET libduckdb)
