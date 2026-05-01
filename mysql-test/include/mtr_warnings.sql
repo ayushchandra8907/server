@@ -105,6 +105,7 @@ INSERT INTO global_suppressions VALUES
 
  ("Got error [0-9]* when reading table"),
  ("Incorrect information in file"),
+ ("Internal memory accounting error of [0-9]+ bytes"),
  ("InnoDB: Warning: we did not need to do crash recovery"),
  /*("Invalid \\(old\\?\\) table or database name"),*/
  ("Lock wait timeout exceeded"),
@@ -295,5 +296,4 @@ BEGIN
   FLUSH NO_WRITE_TO_BINLOG TABLE test_suppressions;
 END
 */||
-
 

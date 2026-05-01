@@ -14,6 +14,7 @@
 #include <cctype>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 char *parquet_lakekeeper_base_url = nullptr;
 char *parquet_lakekeeper_warehouse_id = nullptr;
@@ -441,6 +442,74 @@ bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
   }
 
   *s3_files = extract_manifest_paths(response_body);
+  return true;
+}
+
+bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
+                                std::vector<std::string> *paths,
+                                std::string *error)
+{
+  if (metadata == nullptr || paths == nullptr) {
+    if (error != nullptr)
+      *error = "metadata and paths outputs must not be null";
+    return false;
+  }
+
+  paths->clear();
+  if (!metadata->active_scan_paths.empty()) {
+    *paths = metadata->active_scan_paths;
+    return true;
+  }
+
+  if (!metadata->active_files.empty()) {
+    for (const auto &file : metadata->active_files) {
+      if (!file.path.empty())
+        paths->push_back(file.path);
+    }
+    if (!paths->empty()) {
+      metadata->active_scan_paths = *paths;
+      return true;
+    }
+  }
+
+  std::string response_body;
+  long http_code = 0;
+  if (!fetch_lakekeeper_table_metadata(*metadata, &response_body,
+                                       &http_code)) {
+    if (error != nullptr)
+      *error = "failed to fetch Iceberg REST catalog table metadata";
+    return false;
+  }
+  if (http_code != 200) {
+    if (error != nullptr)
+      *error = "Iceberg REST catalog returned HTTP " +
+               std::to_string(http_code) + " while resolving scan files";
+    return false;
+  }
+
+  *paths = extract_manifest_paths(response_body);
+  if (paths->empty()) {
+    return true;
+  }
+
+  parquet_log_warning(
+      "Parquet table used legacy manifest-list scan fallback; persisting "
+      "active_scan_paths to the sidecar");
+  metadata->active_scan_paths = *paths;
+  if (metadata->active_files.empty()) {
+    for (const auto &path : *paths) {
+      parquet::ActiveDataFile file;
+      file.path = path;
+      file.snapshot_id = metadata->current_snapshot_id;
+      metadata->active_files.push_back(std::move(file));
+    }
+  }
+
+  std::string save_error;
+  if (!parquet::SaveTableMetadata(*metadata, &save_error)) {
+    parquet_log_warning("failed to persist legacy scan-path fallback: " +
+                        save_error);
+  }
   return true;
 }
 

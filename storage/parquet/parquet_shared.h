@@ -66,13 +66,10 @@ bool fetch_lakekeeper_table_metadata(const parquet::TableMetadata &metadata,
 bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
                                 std::vector<std::string> *s3_files,
                                 long *http_code = nullptr);
+bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
+                                std::vector<std::string> *paths,
+                                std::string *error);
 std::string fetch_current_snapshot_data_file(
     const parquet::TableMetadata &metadata);
-
-std::mutex &parquet_duckdb_mutex();
-bool parquet_init_shared_duckdb_runtime(std::string *error);
-void parquet_deinit_shared_duckdb_runtime();
-duckdb::Connection *parquet_handler_connection_locked(std::string *error);
-duckdb::Connection *parquet_pushdown_connection_locked(std::string *error);
 
 #endif

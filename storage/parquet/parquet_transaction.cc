@@ -6,6 +6,7 @@
 
 #include "handler.h"
 #include "mysql/plugin.h"
+#include "table.h"
 
 #include <new>
 
@@ -18,11 +19,6 @@ namespace
 transaction_participant *TxnParticipant(handlerton *hton)
 {
   return static_cast<transaction_participant *>(hton);
-}
-
-const transaction_participant *TxnParticipant(const handlerton *hton)
-{
-  return static_cast<const transaction_participant *>(hton);
 }
 
 } // namespace
@@ -66,6 +62,22 @@ void ClearTxnState(THD *thd, handlerton *hton)
   thd_set_ha_data(thd, TxnParticipant(hton), nullptr);
 }
 
+ParquetTableTxnState *GetOrCreateTableTxnState(ParquetTxnState *txn_state,
+                                               TABLE_SHARE *share)
+{
+  if (txn_state == nullptr || share == nullptr) {
+    return nullptr;
+  }
+
+  const std::string table_path = share->normalized_path.str;
+  auto &table_state = txn_state->tables[table_path];
+  if (table_state.table_path.empty()) {
+    table_state.table_path = table_path;
+    table_state.table_name = share->table_name.str;
+  }
+  return &table_state;
+}
+
 bool IsStagedFileComplete(const ParquetStagedFile &staged_file)
 {
   return !staged_file.table_path.empty() &&
@@ -86,23 +98,35 @@ bool ValidateTxnState(const ParquetTxnState &txn_state, std::string *error)
     return false;
   }
 
-  if (!txn_state.staged_files.empty() && !txn_state.registered_with_server) {
+  if (TxnHasStagedFiles(txn_state) && !txn_state.registered_with_server) {
     if (error != nullptr) {
       *error = "transaction state has staged files but was never registered";
     }
     return false;
   }
 
-  for (const auto &staged_file : txn_state.staged_files) {
-    if (!IsStagedFileComplete(staged_file)) {
-      if (error != nullptr) {
-        *error = "transaction state contains an incomplete staged file entry";
+  for (const auto &entry : txn_state.tables) {
+    for (const auto &staged_file : entry.second.staged_files) {
+      if (!IsStagedFileComplete(staged_file)) {
+        if (error != nullptr) {
+          *error = "transaction state contains an incomplete staged file entry";
+        }
+        return false;
       }
-      return false;
     }
   }
 
   return true;
+}
+
+bool TxnHasStagedFiles(const ParquetTxnState &txn_state)
+{
+  for (const auto &entry : txn_state.tables) {
+    if (!entry.second.staged_files.empty()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string BuildLocalStagePath(const std::string &canonical_parquet_path,
@@ -121,6 +145,32 @@ std::string BuildLocalStagePath(const std::string &canonical_parquet_path,
 
   return canonical_parquet_path + ".stage_" + std::to_string(flush_id) +
          suffix;
+}
+
+std::string BuildLocalDataPath(const std::string &canonical_parquet_path,
+                               uint64_t flush_id)
+{
+  const std::string suffix = ".parquet";
+
+  if (canonical_parquet_path.size() >= suffix.size() &&
+      canonical_parquet_path.compare(canonical_parquet_path.size() -
+                                         suffix.size(),
+                                     suffix.size(), suffix) == 0) {
+    return canonical_parquet_path.substr(
+               0, canonical_parquet_path.size() - suffix.size()) +
+           ".data_" + std::to_string(flush_id) + suffix;
+  }
+
+  return canonical_parquet_path + ".data_" + std::to_string(flush_id) +
+         suffix;
+}
+
+std::string BuildLocalManifestPath(const std::string &canonical_parquet_path,
+                                   const std::string &label,
+                                   uint64_t flush_id)
+{
+  return canonical_parquet_path + "." + label + "_" +
+         std::to_string(flush_id) + ".avro";
 }
 
 std::string BuildPrototypeObjectPath(const std::string &table_name,

@@ -3,13 +3,14 @@
   #include "my_global.h"
   #include "my_config.h"
 
-  #include "sql/table.h"
-  #include "sql/field.h"
-  #include "sql/sql_type.h"
+  #include "table.h"
+  #include "field.h"
+  #include "sql_type.h"
   #include "parquet_catalog.h"
   #include "parquet_iceberg.h"
   #include "parquet_metadata.h"
   #include "parquet_object_store.h"
+  #include "parquet_schema.h"
   #include "parquet_shared.h"
   #include "parquet_transaction.h"
 
@@ -17,8 +18,6 @@
   #include <string>
   #include <tap.h>
 
-
-std::string build_query_create(std::string table_name, TABLE *table_arg);
 
 namespace {
 
@@ -80,8 +79,11 @@ static void test_build_query_basic_schema()
   Field *fields[]= {&id_field, &name_field, nullptr};
   share.field= fields;
 
-  std::string query= build_query_create("users", &table);
-  ok(query == "CREATE TABLE users (id INTEGER, name VARCHAR)",
+  std::string query;
+  std::string error;
+  ok(parquet::BuildDuckDBCreateTableSql("users", &table, &query, &error) &&
+         query == "CREATE TABLE IF NOT EXISTS \"users\" "
+                  "(\"id\" INTEGER, \"name\" VARCHAR)",
      "build_query maps INTEGER and VARCHAR columns");
 }
 
@@ -99,9 +101,38 @@ static void test_build_query_blob_mapping()
   Field *fields[]= {&payload_field, nullptr};
   share.field= fields;
 
-  std::string query= build_query_create("files", &table);
-  ok(query == "CREATE TABLE files (payload BLOB)",
+  std::string query;
+  std::string error;
+  ok(parquet::BuildDuckDBCreateTableSql("files", &table, &query, &error) &&
+         query == "CREATE TABLE IF NOT EXISTS \"files\" (\"payload\" BLOB)",
      "build_query maps binary blob columns to BLOB");
+}
+
+static void test_build_iceberg_schema_json()
+{
+  LEX_CSTRING id_name= {STRING_WITH_LEN("id")};
+  LEX_CSTRING name_name= {STRING_WITH_LEN("name")};
+
+  TABLE table{};
+  TABLE_SHARE share{};
+  table.s= &share;
+
+  Field_long id_field(11, false, &id_name, false);
+  Field_varstring name_field(255, false, &name_name, &share,
+                             DTCollation(&my_charset_bin));
+
+  Field *fields[]= {&id_field, &name_field, nullptr};
+  share.field= fields;
+
+  std::string schema_json;
+  std::string error;
+  ok(parquet::BuildIcebergSchemaJson(&table, 0, &schema_json, &error) &&
+         schema_json.find("\"type\":\"struct\"") != std::string::npos &&
+         schema_json.find("\"name\":\"id\"") != std::string::npos &&
+         schema_json.find("\"type\":\"int\"") != std::string::npos &&
+         schema_json.find("\"name\":\"name\"") != std::string::npos &&
+         schema_json.find("\"type\":\"string\"") != std::string::npos,
+     "shared schema builder maps MariaDB fields to Iceberg schema JSON");
 }
 
 static void test_default_table_options()
@@ -149,7 +180,8 @@ static void test_transaction_state_validation()
      "empty transaction state validates");
 
   txn_state.registered_with_server= true;
-  txn_state.staged_files.push_back({
+  auto &table_state= txn_state.tables["/tmp/test_db/users"];
+  table_state.staged_files.push_back({
       "/tmp/test_db/users",
       "users",
       "/tmp/test_db/users.stage_7.parquet",
@@ -180,6 +212,22 @@ static void test_catalog_base_uri_normalization()
   ok(parquet::NormalizeCatalogBaseUri("http://localhost:8181/catalog/") ==
          "http://localhost:8181/catalog",
      "catalog base URI normalization strips trailing slashes");
+
+  ok(parquet::NormalizeCatalogBaseUri("http://localhost:8181/catalog/v1/") ==
+         "http://localhost:8181/catalog",
+     "catalog base URI normalization accepts versioned REST roots");
+}
+
+static void test_lakekeeper_warehouse_name_lookup()
+{
+  const std::string payload =
+      R"json({"warehouses":[{"id":"11111111-1111-1111-1111-111111111111","warehouse-id":"11111111-1111-1111-1111-111111111111","name":"demo"},{"id":"34222c1a-3c39-11f1-8407-8f978f046b38","warehouse-id":"34222c1a-3c39-11f1-8407-8f978f046b38","name":"bucket_change_1"}]})json";
+  std::string warehouse_name;
+  ok(parquet::FindLakekeeperWarehouseNameById(
+         payload, "34222c1a-3c39-11f1-8407-8f978f046b38",
+         &warehouse_name) &&
+         warehouse_name == "bucket_change_1",
+     "LakeKeeper warehouse management response maps UUID to warehouse name");
 }
 
 static void test_catalog_capability_defaults()
@@ -408,6 +456,25 @@ static void test_metadata_roundtrip()
   std::remove(metadata.metadata_file_path.c_str());
 }
 
+static void test_metadata_sidecar_exists()
+{
+  const char *table_path = "/tmp/parquet_sidecar_exists";
+  const std::string metadata_path =
+      parquet::ResolveMetadataFilePath(table_path);
+  std::remove(metadata_path.c_str());
+
+  const bool absent_before_create = !parquet::MetadataSidecarExists(table_path);
+  FILE *sidecar = std::fopen(metadata_path.c_str(), "wb");
+  if (sidecar != nullptr) {
+    std::fclose(sidecar);
+  }
+  const bool present_after_create = parquet::MetadataSidecarExists(table_path);
+  std::remove(metadata_path.c_str());
+
+  ok(absent_before_create && sidecar != nullptr && present_after_create,
+     "metadata sidecar existence helper distinguishes absent and present sidecars");
+}
+
 static void test_resolve_create_table_metadata_merges_defaults()
 {
   PluginConfigGuard guard;
@@ -487,10 +554,37 @@ static void test_extract_active_scan_paths()
      "active scan paths are derived from active file lineage");
 }
 
+static void test_resolve_scan_paths_from_sidecar()
+{
+  parquet::TableMetadata metadata;
+  metadata.active_scan_paths = {
+      "s3://warehouse/db/t1/data/part-1.parquet",
+      "s3://warehouse/db/t1/data/part-2.parquet"};
+
+  std::vector<std::string> paths;
+  std::string error;
+  ok(resolve_parquet_scan_paths(&metadata, &paths, &error) &&
+         paths.size() == 2 &&
+         paths[0] == "s3://warehouse/db/t1/data/part-1.parquet" &&
+         paths[1] == "s3://warehouse/db/t1/data/part-2.parquet",
+     "scan path resolver reads active_scan_paths without catalog fallback");
+}
+
+static void test_legacy_manifest_list_extraction()
+{
+  auto paths = extract_manifest_paths(
+      R"json({"metadata":{"snapshots":[{"manifest-list":"s3://warehouse/db/t1/data/legacy.parquet"}]}})json");
+  ok(paths.size() == 1 &&
+         paths[0] == "s3://warehouse/db/t1/data/legacy.parquet",
+     "legacy fake manifest-list extraction remains isolated outside handler");
+}
+
 static void test_build_iceberg_commit_artifacts()
 {
   parquet::TableMetadata table_metadata;
   table_metadata.local_paths = parquet::ResolveLocalPaths("/tmp/iceberg_users");
+  table_metadata.metadata_file_path =
+      parquet::ResolveMetadataFilePath(table_metadata.local_paths.table_path.c_str());
   table_metadata.catalog_enabled = true;
   table_metadata.object_store_enabled = true;
   table_metadata.catalog_table_ident.namespace_ident.parts = {"analytics"};
@@ -545,23 +639,42 @@ static void test_build_iceberg_commit_artifacts()
              std::string::npos,
      "Iceberg commit artifacts include manifests, lineage, and commit updates");
 
+  table_metadata.current_snapshot_id = std::to_string(artifacts.snapshot_id);
+  table_metadata.active_files = artifacts.active_files;
+  table_metadata.active_scan_paths =
+      parquet::ExtractActiveScanPaths(table_metadata.active_files);
+  ok(parquet::SaveTableMetadata(table_metadata, &error),
+     "committed Iceberg metadata saves active file lineage to the sidecar");
+
+  parquet::TableMetadata committed_metadata;
+  ok(parquet::LoadTableMetadata(table_metadata.local_paths.table_path.c_str(),
+                                &committed_metadata, &error) &&
+         committed_metadata.current_snapshot_id ==
+             std::to_string(artifacts.snapshot_id) &&
+         committed_metadata.active_files.size() == 1 &&
+         committed_metadata.active_scan_paths.size() == 1,
+     "committed Iceberg metadata reloads active file lineage from the sidecar");
+
   ok(std::remove(artifacts.manifest_local_path.c_str()) == 0 &&
          std::remove(artifacts.manifest_list_local_path.c_str()) == 0,
      "temporary Iceberg manifest artifacts can be cleaned up locally");
+  std::remove(table_metadata.metadata_file_path.c_str());
 }
 
 int main()
 {
-  plan(25);
+  plan(39);
 
   test_build_query_basic_schema();
   test_build_query_blob_mapping();
+  test_build_iceberg_schema_json();
   test_default_table_options();
   test_local_path_resolution();
   test_staged_file_helpers();
   test_transaction_state_validation();
   test_stage_path_helpers();
   test_catalog_base_uri_normalization();
+  test_lakekeeper_warehouse_name_lookup();
   test_catalog_capability_defaults();
   test_catalog_capability_scan_planning();
   test_namespace_path_encoding();
@@ -575,9 +688,12 @@ int main()
   test_parse_catalog_connection_rejects_bearer_token();
   test_build_s3_uri_and_absolute_location();
   test_metadata_roundtrip();
+  test_metadata_sidecar_exists();
   test_resolve_create_table_metadata_merges_defaults();
   test_runtime_defaults_merge();
   test_extract_active_scan_paths();
+  test_resolve_scan_paths_from_sidecar();
+  test_legacy_manifest_list_extraction();
   test_build_iceberg_commit_artifacts();
 
   return exit_status();

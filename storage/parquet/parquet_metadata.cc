@@ -177,7 +177,7 @@ void SetError(std::string *error, const std::string &message)
   }
 }
 
-bool MetadataSidecarExists(const std::string &path)
+bool MetadataSidecarPathExists(const std::string &path)
 {
   std::ifstream stream(path, std::ios::binary);
   return stream.good();
@@ -315,6 +315,11 @@ std::string ResolveMetadataFilePath(const char *table_path)
   }
 
   return std::string(table_path) + ".parquet.meta";
+}
+
+bool MetadataSidecarExists(const char *table_path)
+{
+  return MetadataSidecarPathExists(ResolveMetadataFilePath(table_path));
 }
 
 bool ParseKeyValueOptions(const std::string &serialized,
@@ -569,7 +574,7 @@ bool ResolveRuntimeTableMetadata(const char *table_path, TableMetadata *metadata
   TableMetadata resolved;
   const auto metadata_path = ResolveMetadataFilePath(table_path);
 
-  if (MetadataSidecarExists(metadata_path)) {
+  if (MetadataSidecarPathExists(metadata_path)) {
     if (!LoadTableMetadata(table_path, &resolved, error)) {
       return false;
     }
@@ -660,6 +665,30 @@ bool ValidateObjectStoreConfig(const TableMetadata &metadata,
     return false;
   }
   return true;
+}
+
+void ApplyCatalogLoadResult(TableMetadata *metadata,
+                            const CatalogLoadTableResult &load_result)
+{
+  if (metadata == nullptr) {
+    return;
+  }
+
+  if (!load_result.metadata.table_uuid.empty()) {
+    metadata->table_uuid = load_result.metadata.table_uuid;
+  }
+  if (!load_result.metadata.table_location.empty()) {
+    metadata->table_location = load_result.metadata.table_location;
+  }
+  metadata->current_snapshot_id = load_result.metadata.current_snapshot_id;
+
+  if (metadata->active_scan_paths.empty() && !metadata->active_files.empty()) {
+    for (const auto &file : metadata->active_files) {
+      if (!file.path.empty()) {
+        metadata->active_scan_paths.push_back(file.path);
+      }
+    }
+  }
 }
 
 bool SaveTableMetadata(const TableMetadata &metadata, std::string *error)

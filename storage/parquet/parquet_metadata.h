@@ -55,6 +55,7 @@ struct TableMetadata {
 TableOptions ResolveDefaultTableOptions();
 LocalPaths ResolveLocalPaths(const char *table_path);
 std::string ResolveMetadataFilePath(const char *table_path);
+bool MetadataSidecarExists(const char *table_path);
 
 bool ParseKeyValueOptions(const std::string &serialized,
                           std::map<std::string, std::string> *options,
@@ -82,6 +83,8 @@ bool ValidateCatalogConfig(const TableMetadata &metadata, std::string *error);
 bool ValidateObjectStoreConfig(const TableMetadata &metadata,
                                bool require_credentials,
                                std::string *error);
+void ApplyCatalogLoadResult(TableMetadata *metadata,
+                            const CatalogLoadTableResult &load_result);
 bool SaveTableMetadata(const TableMetadata &metadata, std::string *error);
 bool LoadTableMetadata(const char *table_path, TableMetadata *metadata,
                        std::string *error);

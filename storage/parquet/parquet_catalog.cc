@@ -94,6 +94,34 @@ bool IsUnreservedUrlByte(unsigned char ch)
   return std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~';
 }
 
+bool IsHexDigit(char ch)
+{
+  return std::isxdigit(static_cast<unsigned char>(ch)) != 0;
+}
+
+bool IsUuidLike(const std::string &value)
+{
+  static const size_t kUuidLength = 36;
+  if (value.size() != kUuidLength) {
+    return false;
+  }
+
+  for (size_t i = 0; i < value.size(); ++i) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (value[i] != '-') {
+        return false;
+      }
+      continue;
+    }
+
+    if (!IsHexDigit(value[i])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 std::string PercentEncode(const std::string &value)
 {
   static const char kHex[] = "0123456789ABCDEF";
@@ -110,28 +138,6 @@ std::string PercentEncode(const std::string &value)
     encoded.push_back('%');
     encoded.push_back(kHex[(ch >> 4) & 0x0F]);
     encoded.push_back(kHex[ch & 0x0F]);
-  }
-
-  return encoded;
-}
-
-std::string EncodePathSegments(const std::string &path)
-{
-  std::stringstream stream(path);
-  std::string segment;
-  std::string encoded;
-  bool first = true;
-
-  while (std::getline(stream, segment, '/')) {
-    if (!first) {
-      encoded += "/";
-    }
-    first = false;
-    encoded += PercentEncode(segment);
-  }
-
-  if (!path.empty() && path.back() == '/') {
-    encoded += "/";
   }
 
   return encoded;
@@ -321,6 +327,24 @@ std::string JoinPath(const std::string &lhs, const std::string &rhs)
   }
 
   return lhs + rhs;
+}
+
+std::string LakekeeperManagementWarehouseUrl(const std::string &base_uri)
+{
+  auto normalized = NormalizeCatalogBaseUri(base_uri);
+  while (!normalized.empty() && normalized.back() == '/') {
+    normalized.pop_back();
+  }
+
+  const std::string catalog_suffix = "/catalog";
+  if (normalized.size() < catalog_suffix.size() ||
+      normalized.compare(normalized.size() - catalog_suffix.size(),
+                         catalog_suffix.size(), catalog_suffix) != 0) {
+    return "";
+  }
+
+  normalized.erase(normalized.size() - catalog_suffix.size());
+  return JoinPath(normalized, "/management/v1/warehouse");
 }
 
 std::string NormalizePrefix(const std::string &prefix)
@@ -540,6 +564,41 @@ CatalogStatus ParseCommitSuccessOrError(const HttpResponse &response)
                                          ExtractErrorMessage(response));
 }
 
+CatalogStatus ResolveLakekeeperWarehouseNameById(
+    const CatalogClientConfig &config, const std::string &warehouse_id,
+    std::string *warehouse_name)
+{
+  if (warehouse_name == nullptr) {
+    return MakeStatus(CatalogStatusCode::kInvalidArgument, 0, false, false,
+                      "warehouse_name output must not be null");
+  }
+
+  warehouse_name->clear();
+  const auto url = LakekeeperManagementWarehouseUrl(config.base_uri);
+  if (url.empty()) {
+    return MakeStatus(CatalogStatusCode::kUnsupported, 0, false, false,
+                      "catalog URI does not look like a LakeKeeper catalog URI");
+  }
+
+  auto headers = BuildJsonHeaders(config, "", "", "", "");
+  auto response = ExecuteRequest(config, "GET", url, "", headers);
+  auto status = ParseBasicSuccessOrError(response);
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (!FindLakekeeperWarehouseNameById(response.body, warehouse_id,
+                                       warehouse_name)) {
+    return MakeStatus(CatalogStatusCode::kNotFound, response.status_code, false,
+                      false,
+                      "LakeKeeper management API did not list warehouse ID " +
+                          warehouse_id);
+  }
+
+  return MakeStatus(CatalogStatusCode::kOk, response.status_code, false, false,
+                    "");
+}
+
 std::string GenerateIdempotencyKey()
 {
   const auto counter = idempotency_counter.fetch_add(1);
@@ -549,11 +608,22 @@ std::string GenerateIdempotencyKey()
 bool EndpointMatches(const std::string &endpoint, const char *method,
                      const char *path_suffix)
 {
-  const auto normalized = ToLowerAscii(endpoint);
+  const auto normalized = ToLowerAscii(TrimAsciiWhitespace(endpoint));
   const auto method_prefix = ToLowerAscii(std::string(method)) + " ";
+  const auto suffix = ToLowerAscii(path_suffix);
 
-  return normalized.find(method_prefix) == 0 &&
-         normalized.find(ToLowerAscii(path_suffix)) != std::string::npos;
+  if (normalized.find(method_prefix) != 0) {
+    return false;
+  }
+
+  std::string path = TrimAsciiWhitespace(normalized.substr(
+      method_prefix.size()));
+  while (path.size() > 1 && path.back() == '/') {
+    path.pop_back();
+  }
+
+  return path.size() >= suffix.size() &&
+         path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 CatalogPlannedFile ExtractPlannedFile(const json &task)
@@ -672,7 +742,58 @@ std::string NormalizeCatalogBaseUri(const std::string &base_uri)
     normalized.pop_back();
   }
 
+  const std::string version_suffix = "/v1";
+  if (normalized.size() > version_suffix.size() &&
+      normalized.compare(normalized.size() - version_suffix.size(),
+                         version_suffix.size(), version_suffix) == 0) {
+    normalized.erase(normalized.size() - version_suffix.size());
+  }
+
   return normalized;
+}
+
+bool FindLakekeeperWarehouseNameById(const std::string &management_response_json,
+                                     const std::string &warehouse_id,
+                                     std::string *warehouse_name)
+{
+  if (warehouse_name == nullptr) {
+    return false;
+  }
+
+  warehouse_name->clear();
+  if (warehouse_id.empty()) {
+    return false;
+  }
+
+  try {
+    const auto payload =
+        json::parse(management_response_json.empty() ? "{}"
+                                                     : management_response_json);
+    if (!payload.contains("warehouses") || !payload["warehouses"].is_array()) {
+      return false;
+    }
+
+    for (const auto &warehouse : payload["warehouses"]) {
+      if (!warehouse.is_object()) {
+        continue;
+      }
+
+      const auto id_matches =
+          (warehouse.contains("id") &&
+           JsonScalarToString(warehouse["id"]) == warehouse_id) ||
+          (warehouse.contains("warehouse-id") &&
+           JsonScalarToString(warehouse["warehouse-id"]) == warehouse_id);
+
+      if (id_matches && warehouse.contains("name")) {
+        *warehouse_name = JsonScalarToString(warehouse["name"]);
+        return !warehouse_name->empty();
+      }
+    }
+  } catch (const std::exception &) {
+    return false;
+  }
+
+  return false;
 }
 
 CatalogCapabilitySet ResolveCatalogCapabilities(
@@ -751,14 +872,41 @@ ParquetCatalogClient::ParquetCatalogClient(CatalogClientConfig config)
 
 CatalogStatus ParquetCatalogClient::BootstrapConfig()
 {
-  std::string url = JoinPath(config_.base_uri, "/v1/config");
-  if (!config_.warehouse.empty()) {
-    url += "?warehouse=" + PercentEncode(config_.warehouse);
-  }
+  const auto build_config_url = [this]() {
+    std::string url = JoinPath(config_.base_uri, "/v1/config");
+    if (!config_.warehouse.empty()) {
+      url += "?warehouse=" + PercentEncode(config_.warehouse);
+    }
+    return url;
+  };
 
+  std::string url = build_config_url();
   auto headers = BuildJsonHeaders(config_, "", "", "", "");
   auto response = ExecuteRequest(config_, "GET", url, "", headers);
   auto status = ParseBasicSuccessOrError(response);
+
+  if (!status.ok() && status.code == CatalogStatusCode::kNotFound &&
+      IsUuidLike(config_.warehouse)) {
+    std::string warehouse_name;
+    auto resolve_status = ResolveLakekeeperWarehouseNameById(
+        config_, config_.warehouse, &warehouse_name);
+    if (resolve_status.ok() && !warehouse_name.empty() &&
+        warehouse_name != config_.warehouse) {
+      parquet_log_info("LakeKeeper warehouse ID '" + config_.warehouse +
+                       "' resolved to warehouse name '" + warehouse_name +
+                       "' for Iceberg REST catalog bootstrap");
+      config_.warehouse = warehouse_name;
+      url = build_config_url();
+      headers = BuildJsonHeaders(config_, "", "", "", "");
+      response = ExecuteRequest(config_, "GET", url, "", headers);
+      status = ParseBasicSuccessOrError(response);
+    } else if (!resolve_status.ok()) {
+      parquet_log_warning(
+          "LakeKeeper warehouse ID lookup did not resolve '" +
+          config_.warehouse + "': " + resolve_status.message);
+    }
+  }
+
   if (!status.ok()) {
     return status;
   }
@@ -913,6 +1061,21 @@ CatalogStatus ParquetCatalogClient::CreateTable(
   }
 
   return parsed.status;
+}
+
+CatalogStatus ParquetCatalogClient::DropTable(const CatalogTableIdent &ident)
+{
+  if (ident.table_name.empty() || ident.namespace_ident.parts.empty()) {
+    return MakeStatus(CatalogStatusCode::kInvalidArgument, 0, false, false,
+                      "table identifier is incomplete");
+  }
+
+  const auto url = JoinPath(config_.base_uri,
+                            BuildTablePath(prefix_, ident,
+                                           namespace_separator_));
+  auto headers = BuildJsonHeaders(config_, "", GenerateIdempotencyKey(), "", "");
+  const auto response = ExecuteRequest(config_, "DELETE", url, "", headers);
+  return ParseBasicSuccessOrError(response);
 }
 
 CatalogStatus ParquetCatalogClient::LoadTable(const CatalogTableIdent &ident,

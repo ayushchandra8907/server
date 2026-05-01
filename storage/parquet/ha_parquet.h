@@ -11,31 +11,8 @@
 #include "duckdb.hpp"
 
 
-#include <cstdint>
 #include <memory>
-#include <map>
-#include <vector>
 #include <string>
-
-
-struct parquet_local_stage_file {
- std::string local_path;
- uint64_t    row_count = 0;
-};
-
-struct parquet_table_trx_data {
- std::string table_name;
- std::string table_path;
- std::string statement_buffer_name;
- uint64_t    statement_row_count = 0;
- std::unique_ptr<duckdb::Appender> statement_appender;
- std::vector<parquet_local_stage_file> staged_files;
- std::vector<std::string> uploaded_s3_file_paths;
-};
-
-struct parquet_trx_data {
- std::map<std::string, parquet_table_trx_data> tables;
-};
 
 
 class ha_parquet final : public handler
