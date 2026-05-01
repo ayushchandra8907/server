@@ -47,6 +47,7 @@ struct TableMetadata {
   std::string table_uuid;
   std::string table_location;
   std::string current_snapshot_id;
+  std::string raw_catalog_metadata_json;
   std::string metadata_file_path;
   std::vector<ActiveDataFile> active_files;
   std::vector<std::string> active_scan_paths;
@@ -83,8 +84,18 @@ bool ValidateCatalogConfig(const TableMetadata &metadata, std::string *error);
 bool ValidateObjectStoreConfig(const TableMetadata &metadata,
                                bool require_credentials,
                                std::string *error);
-void ApplyCatalogLoadResult(TableMetadata *metadata,
-                            const CatalogLoadTableResult &load_result);
+bool ReconcileObjectStoreConfigWithTableLocation(TableMetadata *metadata,
+                                                 std::string *error);
+bool BuildConfiguredTableLocationUri(const ObjectStoreConfig &config,
+                                     std::string *location_uri,
+                                     std::string *error);
+bool ResolveTableObjectLocation(const TableMetadata &metadata,
+                                const std::string &relative_key,
+                                ObjectLocation *location,
+                                std::string *error);
+bool ApplyCatalogLoadResult(TableMetadata *metadata,
+                            const CatalogLoadTableResult &load_result,
+                            std::string *error);
 bool SaveTableMetadata(const TableMetadata &metadata, std::string *error);
 bool LoadTableMetadata(const char *table_path, TableMetadata *metadata,
                        std::string *error);

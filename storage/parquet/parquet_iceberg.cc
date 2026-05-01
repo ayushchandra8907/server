@@ -66,8 +66,8 @@ struct ManifestListEntry {
 
 uint64_t NextUniqueId()
 {
-  static std::mt19937_64 generator(std::random_device{}());
-  static std::uniform_int_distribution<uint64_t> distribution(
+  thread_local std::mt19937_64 generator(std::random_device{}());
+  thread_local std::uniform_int_distribution<uint64_t> distribution(
       1ULL << 40, std::numeric_limits<uint64_t>::max() >> 1);
   return distribution(generator);
 }
@@ -739,10 +739,15 @@ bool BuildIcebergCommitArtifacts(
   const auto manifest_list_local_path = BuildLocalTempPath(
       table_metadata.local_paths.table_path, "iceberg_manifest_list", snapshot_id,
       token);
-  const auto manifest_location = ResolveObjectLocation(
-      table_metadata.object_store_config, "metadata/" + manifest_name);
-  const auto manifest_list_location = ResolveObjectLocation(
-      table_metadata.object_store_config, "metadata/" + manifest_list_name);
+  ObjectLocation manifest_location;
+  ObjectLocation manifest_list_location;
+  if (!ResolveTableObjectLocation(table_metadata, "metadata/" + manifest_name,
+                                  &manifest_location, error) ||
+      !ResolveTableObjectLocation(table_metadata,
+                                  "metadata/" + manifest_list_name,
+                                  &manifest_list_location, error)) {
+    return false;
+  }
 
   if (!WriteManifestFile(manifest_local_path, state, manifest_entries, error)) {
     return false;

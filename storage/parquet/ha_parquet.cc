@@ -4,6 +4,7 @@
 #include "ha_parquet_pushdown.h"
 
 #include "parquet_catalog.h"
+#include "parquet_create.h"
 #include "parquet_duckdb.h"
 #include "parquet_iceberg.h"
 #include "parquet_metadata.h"
@@ -399,6 +400,27 @@ bool materialize_upload_and_build_artifacts(CommitWork *work,
                                             std::string *error)
 {
   auto *table_state = work->table_state;
+  const bool has_pending_files =
+      !table_state->local_stage_files.empty() ||
+      !table_state->staged_files.empty();
+  if (has_pending_files) {
+    auto load_status = work->catalog_client->LoadTable(
+        work->metadata.catalog_table_ident, &work->load_result,
+        work->metadata.access_delegation);
+    if (!load_status.ok()) {
+      if (error != nullptr) {
+        *error = catalog_status_message(
+            "failed to load Iceberg table before commit", load_status);
+      }
+      return false;
+    }
+
+    if (!parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result,
+                                         error)) {
+      return false;
+    }
+  }
+
   parquet::ParquetStagedFile staged_file;
   if (!parquet::MaterializeLocalDataFile(table_state, work->metadata,
                                          &staged_file, error)) {
@@ -407,19 +429,6 @@ bool materialize_upload_and_build_artifacts(CommitWork *work,
   if (table_state->staged_files.empty()) {
     return true;
   }
-
-  auto load_status = work->catalog_client->LoadTable(
-      work->metadata.catalog_table_ident, &work->load_result,
-      work->metadata.access_delegation);
-  if (!load_status.ok()) {
-    if (error != nullptr) {
-      *error = catalog_status_message(
-          "failed to load Iceberg table before commit", load_status);
-    }
-    return false;
-  }
-
-  parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result);
 
   parquet::ParquetObjectStoreClient object_store(
       work->metadata.object_store_config);
@@ -464,7 +473,10 @@ bool materialize_upload_and_build_artifacts(CommitWork *work,
 
 bool save_committed_metadata(CommitWork *work, std::string *error)
 {
-  parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result);
+  if (!parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result,
+                                       error)) {
+    return false;
+  }
   work->metadata.current_snapshot_id =
       std::to_string(work->artifacts.snapshot_id);
   work->metadata.active_files = work->artifacts.active_files;
@@ -597,81 +609,28 @@ void ha_parquet::cond_pop()
 int ha_parquet::create(const char *name, TABLE *table_arg,
                        HA_CREATE_INFO *create_info)
 {
-  parquet::TableMetadata metadata;
   std::string error;
   const auto *options = parquet_table_options(create_info);
-  if (!parquet::ResolveCreateTableMetadata(
-          name, options != nullptr ? options->catalog : nullptr,
-          options != nullptr ? options->connection : nullptr, &metadata,
+  parquet::CreateTableResult result;
+  if (!parquet::CreateParquetTable(
+          name, table_arg, options != nullptr ? options->catalog : nullptr,
+          options != nullptr ? options->connection : nullptr, &result,
           &error)) {
-    raise_create_option_error(error);
-    return HA_ERR_UNSUPPORTED;
-  }
-  if (!parquet::ValidateCatalogConfig(metadata, &error) ||
-      !parquet::ValidateObjectStoreConfig(metadata, true, &error)) {
-    raise_unknown_error(error);
-    return HA_ERR_UNSUPPORTED;
-  }
-
-  helper_db_path = metadata.local_paths.helper_db_path;
-  parquet_file_path = metadata.local_paths.parquet_file_path;
-
-  const std::string buffer_table_name =
-      "buf_" + metadata.local_paths.table_name;
-  if (!parquet::SeedEmptyLocalParquet(table_arg, buffer_table_name,
-                                      metadata.local_paths.parquet_file_path,
-                                      &error)) {
-    raise_unknown_error("Failed to create local Parquet seed file: " + error);
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
-  std::string schema_json;
-  if (!parquet::BuildIcebergSchemaJson(table_arg, 0, &schema_json, &error)) {
-    raise_unknown_error(error);
-    return HA_ERR_UNSUPPORTED;
-  }
-
-  parquet::ParquetCatalogClient catalog_client(metadata.catalog_config);
-  if (!bootstrap_catalog_or_error(&catalog_client, &error)) {
+    if (result.error_kind ==
+        parquet::CreateTableErrorKind::kInvalidCreateOption) {
+      raise_create_option_error(error);
+      return HA_ERR_UNSUPPORTED;
+    }
+    if (result.error_kind == parquet::CreateTableErrorKind::kUnsupported) {
+      raise_unknown_error(error);
+      return HA_ERR_UNSUPPORTED;
+    }
     raise_unknown_error(error);
     return HA_ERR_INTERNAL_ERROR;
   }
 
-  auto namespace_status =
-      catalog_client.EnsureNamespace(metadata.catalog_table_ident.namespace_ident);
-  if (!namespace_status.ok() &&
-      namespace_status.code != parquet::CatalogStatusCode::kConflict) {
-    raise_unknown_error(catalog_status_message(
-        "failed to ensure Iceberg namespace", namespace_status));
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
-  parquet::CatalogCreateTableRequest request;
-  request.ident = metadata.catalog_table_ident;
-  request.schema_json = schema_json;
-  const auto table_location =
-      parquet::ResolveObjectLocation(metadata.object_store_config, "");
-  request.location =
-      parquet::BuildS3Uri(table_location.bucket, table_location.key);
-
-  parquet::CatalogLoadTableResult create_result;
-  auto create_status = catalog_client.CreateTable(request, &create_result);
-  if (create_status.code == parquet::CatalogStatusCode::kConflict) {
-    create_status = catalog_client.LoadTable(
-        metadata.catalog_table_ident, &create_result, metadata.access_delegation);
-  }
-  if (!create_status.ok()) {
-    raise_unknown_error(catalog_status_message(
-        "failed to create Iceberg REST catalog table", create_status));
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
-  parquet::ApplyCatalogLoadResult(&metadata, create_result);
-  if (!parquet::SaveTableMetadata(metadata, &error)) {
-    raise_unknown_error("Failed to persist Parquet table metadata: " + error);
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
+  helper_db_path = result.metadata.local_paths.helper_db_path;
+  parquet_file_path = result.metadata.local_paths.parquet_file_path;
   return 0;
 }
 

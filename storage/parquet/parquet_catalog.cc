@@ -1096,6 +1096,24 @@ CatalogStatus ParquetCatalogClient::LoadTable(const CatalogTableIdent &ident,
   return result->status;
 }
 
+CatalogStatus ParquetCatalogClient::LoadRawTableMetadata(
+    const CatalogTableIdent &ident, std::string *raw_metadata_json,
+    const std::string &access_delegation)
+{
+  if (raw_metadata_json == nullptr) {
+    return MakeStatus(CatalogStatusCode::kInvalidArgument, 0, false, false,
+                      "raw_metadata_json must not be null");
+  }
+
+  raw_metadata_json->clear();
+  CatalogLoadTableResult result;
+  auto status = LoadTable(ident, &result, access_delegation);
+  if (status.ok()) {
+    *raw_metadata_json = result.metadata.raw_metadata_json;
+  }
+  return status;
+}
+
 CatalogStatus ParquetCatalogClient::CommitTable(
     const CatalogCommitRequest &request, CatalogLoadTableResult *result)
 {

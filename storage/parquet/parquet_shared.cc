@@ -2,13 +2,11 @@
 
 #include "parquet_shared.h"
 
-#include "parquet_catalog.h"
+#include "parquet_duckdb.h"
 #include "parquet_metadata.h"
 #include "parquet_object_store.h"
 
 #include "log.h"
-
-#include <curl/curl.h>
 
 #include <algorithm>
 #include <cctype>
@@ -54,13 +52,6 @@ std::string trim_slashes_copy(std::string value)
   return value;
 }
 
-std::string normalize_url_base(std::string value)
-{
-  while (!value.empty() && value.back() == '/')
-    value.pop_back();
-  return value;
-}
-
 std::string single_line_copy(std::string value)
 {
   for (char &ch : value) {
@@ -75,45 +66,6 @@ std::string string_from_sysvar(const char *value, const char *fallback = "")
   if (value != nullptr)
     return value;
   return fallback;
-}
-
-size_t curl_write_to_string(char *ptr, size_t size, size_t nmemb,
-                            void *userdata)
-{
-  auto *body = static_cast<std::string *>(userdata);
-  body->append(ptr, size * nmemb);
-  return size * nmemb;
-}
-
-std::string namespace_path_from_metadata(const parquet::TableMetadata &metadata)
-{
-  if (metadata.catalog_table_ident.namespace_ident.parts.empty()) {
-    parquet::CatalogNamespaceIdent default_ident{{"default"}};
-    return parquet::EncodeNamespaceForUrlPath(default_ident, "%1F");
-  }
-
-  return parquet::EncodeNamespaceForUrlPath(
-      metadata.catalog_table_ident.namespace_ident, "%1F");
-}
-
-void apply_catalog_auth_header(const parquet::CatalogClientConfig &config,
-                               struct curl_slist **headers)
-{
-  if (headers == nullptr || config.bearer_token.empty())
-    return;
-
-  *headers = curl_slist_append(
-      *headers, ("Authorization: Bearer " + config.bearer_token).c_str());
-}
-
-void apply_catalog_curl_options(CURL *curl,
-                                const parquet::CatalogClientConfig &config)
-{
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout_ms);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, config.timeout_ms);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, config.verify_peer ? 1L : 0L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, config.verify_host ? 2L : 0L);
 }
 
 std::string duckdb_s3_endpoint_setting(const std::string &endpoint)
@@ -275,62 +227,20 @@ bool configure_duckdb_s3(duckdb::Connection *con,
                    "' url_style='" + config.url_style + "'");
 
   if (!config.region.empty()) {
-    con->Query("SET s3_region=" + quote_string_literal(config.region));
+    if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_region=" + quote_string_literal(config.region), error)) return false;
   }
-  con->Query("SET s3_access_key_id=" +
-             quote_string_literal(config.credentials.access_key_id));
-  con->Query("SET s3_secret_access_key=" +
-             quote_string_literal(config.credentials.secret_access_key));
+  if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_access_key_id=" + quote_string_literal(config.credentials.access_key_id), error)) return false;
+  if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_secret_access_key=" + quote_string_literal(config.credentials.secret_access_key), error)) return false;
   if (!config.credentials.session_token.empty()) {
-    con->Query("SET s3_session_token=" +
-               quote_string_literal(config.credentials.session_token));
+    if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_session_token=" + quote_string_literal(config.credentials.session_token), error)) return false;
   }
 
   if (!config.endpoint.empty()) {
-    con->Query("SET s3_endpoint=" +
-               quote_string_literal(duckdb_s3_endpoint_setting(config.endpoint)));
-    con->Query(std::string("SET s3_use_ssl=") +
-               (duckdb_s3_use_ssl(config.endpoint) ? "true" : "false"));
+    if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_endpoint=" + quote_string_literal(duckdb_s3_endpoint_setting(config.endpoint)), error)) return false;
+    if (!parquet::parquet_run_duckdb_query(con, "S3 config", std::string("SET s3_use_ssl=") + (duckdb_s3_use_ssl(config.endpoint) ? "true" : "false"), error)) return false;
   }
-  con->Query("SET s3_url_style=" +
-             quote_string_literal(duckdb_s3_url_style(config.url_style)));
+  if (!parquet::parquet_run_duckdb_query(con, "S3 config", "SET s3_url_style=" + quote_string_literal(duckdb_s3_url_style(config.url_style)), error)) return false;
   return true;
-}
-
-std::string lakekeeper_table_collection_url(
-    const parquet::TableMetadata &metadata)
-{
-  if (metadata.catalog_config.base_uri.empty() ||
-      metadata.catalog_config.warehouse.empty()) {
-    return "";
-  }
-
-  return normalize_url_base(
-             parquet::NormalizeCatalogBaseUri(metadata.catalog_config.base_uri)) +
-         "/" + metadata.catalog_config.warehouse + "/namespaces/" +
-         namespace_path_from_metadata(metadata) + "/tables";
-}
-
-std::string lakekeeper_table_url(const parquet::TableMetadata &metadata)
-{
-  const auto collection_url = lakekeeper_table_collection_url(metadata);
-  if (collection_url.empty() || metadata.catalog_table_ident.table_name.empty())
-    return "";
-
-  return collection_url + "/" + metadata.catalog_table_ident.table_name;
-}
-
-std::string lakekeeper_transaction_commit_url(
-    const parquet::TableMetadata &metadata)
-{
-  if (metadata.catalog_config.base_uri.empty() ||
-      metadata.catalog_config.warehouse.empty()) {
-    return "";
-  }
-
-  return normalize_url_base(
-             parquet::NormalizeCatalogBaseUri(metadata.catalog_config.base_uri)) +
-         "/" + metadata.catalog_config.warehouse + "/transactions/commit";
 }
 
 std::string table_name_from_path(const std::string &table_path)
@@ -339,7 +249,8 @@ std::string table_name_from_path(const std::string &table_path)
   return (pos == std::string::npos) ? table_path : table_path.substr(pos + 1);
 }
 
-std::vector<std::string> extract_manifest_paths(const std::string &response_body)
+std::vector<std::string> extract_legacy_fake_manifest_list_scan_paths(
+    const std::string &response_body)
 {
   std::vector<std::string> s3_files;
   std::unordered_set<std::string> seen_s3_files;
@@ -358,91 +269,21 @@ std::vector<std::string> extract_manifest_paths(const std::string &response_body
 
     std::string path = response_body.substr(value_start + 1,
                                             value_end - value_start - 1);
-    if (path.rfind("s3://", 0) == 0 && seen_s3_files.insert(path).second)
+    std::string lowered = path;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char ch) {
+                     return static_cast<char>(std::tolower(ch));
+                   });
+    const bool looks_like_legacy_fake_data_file =
+        path.rfind("s3://", 0) == 0 &&
+        lowered.size() >= 8 &&
+        lowered.compare(lowered.size() - 8, 8, ".parquet") == 0;
+    if (looks_like_legacy_fake_data_file && seen_s3_files.insert(path).second)
       s3_files.push_back(path);
 
     pos = value_end + 1;
   }
   return s3_files;
-}
-
-bool fetch_lakekeeper_table_metadata(const parquet::TableMetadata &metadata,
-                                     std::string *response_body,
-                                     long *http_code)
-{
-  if (!response_body || !http_code)
-    return false;
-
-  response_body->clear();
-  *http_code = 0;
-
-  const std::string lakekeeper_url = lakekeeper_table_url(metadata);
-  if (lakekeeper_url.empty())
-    return false;
-
-  parquet_log_info("LakeKeeper load table metadata table='" +
-                   metadata.catalog_table_ident.table_name + "' url='" +
-                   lakekeeper_url + "'");
-
-  CURL *curl = curl_easy_init();
-  if (!curl)
-    return false;
-
-  struct curl_slist *headers = nullptr;
-  apply_catalog_auth_header(metadata.catalog_config, &headers);
-  curl_easy_setopt(curl, CURLOPT_URL, lakekeeper_url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +curl_write_to_string);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_body);
-  apply_catalog_curl_options(curl, metadata.catalog_config);
-  if (headers != nullptr)
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-  CURLcode res = curl_easy_perform(curl);
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
-  if (headers != nullptr)
-    curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res == CURLE_OK) {
-    parquet_log_info("LakeKeeper load table metadata complete table='" +
-                     metadata.catalog_table_ident.table_name +
-                     "' http_status=" + std::to_string(*http_code) +
-                     " response=" + parquet_log_preview(*response_body));
-  } else {
-    parquet_log_warning("LakeKeeper load table metadata failed table='" +
-                        metadata.catalog_table_ident.table_name + "' error='" +
-                        std::string(curl_easy_strerror(res)) + "'");
-  }
-
-  return res == CURLE_OK;
-}
-
-bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
-                                std::vector<std::string> *s3_files,
-                                long *http_code)
-{
-  if (!s3_files)
-    return false;
-
-  std::string response_body;
-  long local_http_code = 0;
-  if (!fetch_lakekeeper_table_metadata(metadata, &response_body,
-                                       &local_http_code)) {
-    if (http_code)
-      *http_code = local_http_code;
-    return false;
-  }
-
-  if (http_code)
-    *http_code = local_http_code;
-
-  if (local_http_code != 200) {
-    s3_files->clear();
-    return true;
-  }
-
-  *s3_files = extract_manifest_paths(response_body);
-  return true;
 }
 
 bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
@@ -472,23 +313,20 @@ bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
     }
   }
 
-  std::string response_body;
-  long http_code = 0;
-  if (!fetch_lakekeeper_table_metadata(*metadata, &response_body,
-                                       &http_code)) {
-    if (error != nullptr)
-      *error = "failed to fetch Iceberg REST catalog table metadata";
-    return false;
-  }
-  if (http_code != 200) {
-    if (error != nullptr)
-      *error = "Iceberg REST catalog returned HTTP " +
-               std::to_string(http_code) + " while resolving scan files";
-    return false;
-  }
-
-  *paths = extract_manifest_paths(response_body);
+  // Legacy migration only: early sidecars stored fake data-file paths in the
+  // catalog metadata "manifest-list" field instead of active_files.
+  *paths = extract_legacy_fake_manifest_list_scan_paths(
+      metadata->raw_catalog_metadata_json);
   if (paths->empty()) {
+    // An empty Iceberg table with a snapshot but no data files is valid
+    // (e.g. a newly created table where LakeKeeper issues an initial empty
+    // snapshot). Return an empty path list so callers produce zero rows.
+    if (!metadata->current_snapshot_id.empty()) {
+      parquet_log_info(
+          "Parquet table has Iceberg snapshot '" +
+          metadata->current_snapshot_id +
+          "' but no data files yet; returning empty scan path list");
+    }
     return true;
   }
 
@@ -511,16 +349,4 @@ bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
                         save_error);
   }
   return true;
-}
-
-std::string fetch_current_snapshot_data_file(
-    const parquet::TableMetadata &metadata)
-{
-  std::vector<std::string> s3_files;
-  long http_code = 0;
-  if (!resolve_parquet_data_files(metadata, &s3_files, &http_code))
-    return "";
-  if (http_code != 200 || s3_files.empty())
-    return "";
-  return s3_files.front();
 }

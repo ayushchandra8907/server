@@ -153,6 +153,9 @@ public:
   CatalogStatus LoadTable(const CatalogTableIdent &ident,
                           CatalogLoadTableResult *result,
                           const std::string &access_delegation = "");
+  CatalogStatus LoadRawTableMetadata(const CatalogTableIdent &ident,
+                                     std::string *raw_metadata_json,
+                                     const std::string &access_delegation = "");
   CatalogStatus CommitTable(const CatalogCommitRequest &request,
                             CatalogLoadTableResult *result);
   CatalogStatus CommitTransactionIfSupported(

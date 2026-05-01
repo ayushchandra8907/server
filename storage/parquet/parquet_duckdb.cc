@@ -19,6 +19,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <atomic>
 
 namespace parquet
 {
@@ -244,9 +245,9 @@ duckdb::Connection *parquet_pushdown_connection_locked(std::string *error)
 
 uint64_t NextParquetFlushId()
 {
-  static uint64_t flush_counter = 0;
+  static std::atomic<uint64_t> flush_counter{0};
   return static_cast<uint64_t>(time(nullptr)) * 1000ULL +
-         (flush_counter++ % 1000ULL);
+         (flush_counter.fetch_add(1, std::memory_order_relaxed) % 1000ULL);
 }
 
 std::string StatementBufferName(unsigned long long thread_id,
@@ -478,9 +479,12 @@ bool MaterializeLocalDataFile(ParquetTableTxnState *table_state,
   const auto flush_id = NextParquetFlushId();
   const std::string local_data_path =
       BuildLocalDataPath(metadata.local_paths.parquet_file_path, flush_id);
-  const auto object_location = ResolveObjectLocation(
-      metadata.object_store_config,
-      "data/part_" + std::to_string(flush_id) + ".parquet");
+  ObjectLocation object_location;
+  if (!ResolveTableObjectLocation(
+          metadata, "data/part_" + std::to_string(flush_id) + ".parquet",
+          &object_location, error)) {
+    return false;
+  }
   const std::string target_object_path =
       BuildS3Uri(object_location.bucket, object_location.key);
 
@@ -557,6 +561,9 @@ bool SeedEmptyLocalParquet(TABLE *table,
       return false;
     }
 
+    parquet_run_duckdb_query(connection, "create/cleanup-old-buffer",
+                             "DROP TABLE IF EXISTS " + QuoteIdentifier(buffer_table_name), nullptr);
+
     std::string create_sql;
     if (!BuildDuckDBCreateTableSql(buffer_table_name, table, &create_sql,
                                    error)) {
@@ -569,8 +576,12 @@ bool SeedEmptyLocalParquet(TABLE *table,
 
     const std::string copy_query = BuildDuckDBCopyToParquetSql(
         QuoteIdentifier(buffer_table_name), parquet_file_path);
-    return parquet_run_duckdb_query(connection, "create/seed-parquet",
-                                    copy_query, error);
+    bool copy_ok = parquet_run_duckdb_query(connection, "create/seed-parquet",
+                                            copy_query, error);
+
+    parquet_run_duckdb_query(connection, "create/cleanup-buffer",
+                             "DROP TABLE IF EXISTS " + QuoteIdentifier(buffer_table_name), nullptr);
+    return copy_ok;
   } catch (const std::exception &ex) {
     if (error != nullptr) {
       *error = ex.what();

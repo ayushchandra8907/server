@@ -594,6 +594,9 @@ bool ResolveRuntimeTableMetadata(const char *table_path, TableMetadata *metadata
   const auto defaults = parquet_plugin_config_snapshot();
   ApplyCatalogDefaults(defaults, &resolved);
   ApplyObjectStoreDefaults(defaults, &resolved);
+  if (!ReconcileObjectStoreConfigWithTableLocation(&resolved, error)) {
+    return false;
+  }
   FinalizeResolvedMetadata(&resolved);
 
   *metadata = std::move(resolved);
@@ -667,11 +670,85 @@ bool ValidateObjectStoreConfig(const TableMetadata &metadata,
   return true;
 }
 
-void ApplyCatalogLoadResult(TableMetadata *metadata,
-                            const CatalogLoadTableResult &load_result)
+bool ReconcileObjectStoreConfigWithTableLocation(TableMetadata *metadata,
+                                                 std::string *error)
 {
   if (metadata == nullptr) {
-    return;
+    SetError(error, "metadata pointer must not be null");
+    return false;
+  }
+
+  if (metadata->table_location.empty()) {
+    return true;
+  }
+
+  ObjectLocation table_root;
+  if (!ParseS3Uri(metadata->table_location, &table_root)) {
+    SetError(error, "Iceberg table location must be an s3:// URI: " +
+                        metadata->table_location);
+    return false;
+  }
+
+  table_root.key = NormalizeObjectKeyPrefix(table_root.key);
+  metadata->object_store_config.bucket = table_root.bucket;
+  metadata->object_store_config.key_prefix = table_root.key;
+  metadata->table_location = BuildS3Uri(table_root.bucket, table_root.key);
+  return true;
+}
+
+bool BuildConfiguredTableLocationUri(const ObjectStoreConfig &config,
+                                     std::string *location_uri,
+                                     std::string *error)
+{
+  if (location_uri == nullptr) {
+    SetError(error, "table location output pointer must not be null");
+    return false;
+  }
+
+  const auto location = ResolveObjectLocation(config, "");
+  const auto uri = BuildS3Uri(location.bucket, location.key);
+  if (uri.empty()) {
+    SetError(error, "failed to resolve configured Iceberg table location");
+    return false;
+  }
+
+  *location_uri = uri;
+  return true;
+}
+
+bool ResolveTableObjectLocation(const TableMetadata &metadata,
+                                const std::string &relative_key,
+                                ObjectLocation *location,
+                                std::string *error)
+{
+  if (location == nullptr) {
+    SetError(error, "object location output pointer must not be null");
+    return false;
+  }
+
+  ObjectStoreConfig config = metadata.object_store_config;
+  if (!metadata.table_location.empty()) {
+    ObjectLocation table_root;
+    if (!ParseS3Uri(metadata.table_location, &table_root)) {
+      SetError(error, "Iceberg table location must be an s3:// URI: " +
+                          metadata.table_location);
+      return false;
+    }
+    config.bucket = table_root.bucket;
+    config.key_prefix = NormalizeObjectKeyPrefix(table_root.key);
+  }
+
+  *location = ResolveObjectLocation(config, relative_key);
+  return true;
+}
+
+bool ApplyCatalogLoadResult(TableMetadata *metadata,
+                            const CatalogLoadTableResult &load_result,
+                            std::string *error)
+{
+  if (metadata == nullptr) {
+    SetError(error, "metadata pointer must not be null");
+    return false;
   }
 
   if (!load_result.metadata.table_uuid.empty()) {
@@ -679,6 +756,10 @@ void ApplyCatalogLoadResult(TableMetadata *metadata,
   }
   if (!load_result.metadata.table_location.empty()) {
     metadata->table_location = load_result.metadata.table_location;
+  }
+  if (!load_result.metadata.raw_metadata_json.empty()) {
+    metadata->raw_catalog_metadata_json =
+        load_result.metadata.raw_metadata_json;
   }
   metadata->current_snapshot_id = load_result.metadata.current_snapshot_id;
 
@@ -689,6 +770,8 @@ void ApplyCatalogLoadResult(TableMetadata *metadata,
       }
     }
   }
+
+  return ReconcileObjectStoreConfigWithTableLocation(metadata, error);
 }
 
 bool SaveTableMetadata(const TableMetadata &metadata, std::string *error)
@@ -748,6 +831,7 @@ bool SaveTableMetadata(const TableMetadata &metadata, std::string *error)
   payload["table_uuid"] = metadata.table_uuid;
   payload["table_location"] = metadata.table_location;
   payload["current_snapshot_id"] = metadata.current_snapshot_id;
+  payload["raw_catalog_metadata_json"] = metadata.raw_catalog_metadata_json;
   payload["active_files"] = ActiveDataFilesToJson(metadata.active_files);
   payload["active_scan_paths"] = active_scan_paths;
 
@@ -870,6 +954,8 @@ bool LoadTableMetadata(const char *table_path, TableMetadata *metadata,
         payload.value("table_location", std::string());
     loaded.current_snapshot_id =
         payload.value("current_snapshot_id", std::string());
+    loaded.raw_catalog_metadata_json =
+        payload.value("raw_catalog_metadata_json", std::string());
     if (payload.contains("active_files")) {
       loaded.active_files = JsonToActiveDataFiles(payload["active_files"]);
     }

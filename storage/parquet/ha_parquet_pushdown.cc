@@ -143,7 +143,7 @@ int ha_parquet_select_handler::init_scan()
     std::string error_message;
     duckdb_con = parquet::parquet_pushdown_connection_locked(&error_message);
     if (duckdb_con == nullptr) {
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
   }
@@ -190,7 +190,7 @@ int ha_parquet_select_handler::init_scan()
         !parquet::ValidateObjectStoreConfig(metadata, true, &error_message)) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
@@ -201,7 +201,7 @@ int ha_parquet_select_handler::init_scan()
                                           metadata.object_store_config)) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0),
                "Parquet pushdown currently requires matching object-store "
                "credentials and endpoint settings across Parquet tables");
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
@@ -211,7 +211,7 @@ int ha_parquet_select_handler::init_scan()
                              &error_message)) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
@@ -219,7 +219,7 @@ int ha_parquet_select_handler::init_scan()
     if (!resolve_parquet_scan_paths(&metadata, &scan_paths, &error_message)) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
@@ -230,7 +230,7 @@ int ha_parquet_select_handler::init_scan()
               &error_message)) {
         cleanup_temp_views();
         cleanup_external_registry();
-        my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+        my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
         DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
       }
     } else {
@@ -241,7 +241,7 @@ int ha_parquet_select_handler::init_scan()
     if (create_view_sql.empty()) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0),
                "Parquet pushdown could not map the table schema to DuckDB");
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
@@ -255,7 +255,7 @@ int ha_parquet_select_handler::init_scan()
       const std::string error_message =
           create_view_result ? create_view_result->GetError()
                              : "DuckDB returned a null result while creating a Parquet view";
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
     temp_view_names.push_back(tbl->table_name.str);
@@ -267,7 +267,7 @@ int ha_parquet_select_handler::init_scan()
                              &error_message)) {
       cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
   }
@@ -294,7 +294,7 @@ int ha_parquet_select_handler::init_scan()
     const std::string error_message =
         query_result ? query_result->GetError()
                      : "DuckDB returned a null result for Parquet pushdown";
-    my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+    my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
@@ -330,7 +330,7 @@ int ha_parquet_select_handler::next_row()
     std::string error_message;
     if (!parquet::StoreDuckDBValueInMariaDBField(field, value, thd,
                                                  &error_message)) {
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
   }
@@ -378,6 +378,72 @@ int ha_parquet_select_handler::end_scan()
   DBUG_RETURN(0);
 }
 
+bool is_duckdb_pushdown_supported(THD *thd, SELECT_LEX *sel_lex,
+                                  const std::vector<TABLE_LIST *> &parquet_tables,
+                                  const std::vector<TABLE_LIST *> &external_tables)
+{
+  if (!thd || !thd->query())
+    return false;
+    
+  std::string sql(thd->query(), thd->query_length());
+
+  // Strip a leading EXPLAIN keyword so we don't double-wrap when MariaDB
+  // calls create_select during its own EXPLAIN processing.
+  {
+    size_t pos = 0;
+    while (pos < sql.size() && std::isspace((unsigned char)sql[pos]))
+      ++pos;
+    if (pos + 7 <= sql.size()) {
+      std::string prefix = sql.substr(pos, 7);
+      std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::toupper);
+      if (prefix == "EXPLAIN") {
+        pos += 7;
+        while (pos < sql.size() && std::isspace((unsigned char)sql[pos]))
+          ++pos;
+        sql = sql.substr(pos);
+      }
+    }
+  }
+  
+  std::lock_guard<std::mutex> lock(parquet::parquet_duckdb_mutex());
+  std::string error;
+  duckdb::Connection *con = parquet::parquet_pushdown_connection_locked(&error);
+  if (!con) return false;
+
+  std::vector<std::string> temp_views;
+  
+  for (auto *tbl : parquet_tables) {
+    if (!tbl || !tbl->table) continue;
+    std::string create_sql;
+    if (parquet::BuildDuckDBEmptyViewSql(tbl->table_name.str, tbl->table, &create_sql, &error)) {
+      if (!con->Query(create_sql)->HasError()) {
+        temp_views.push_back(tbl->table_name.str);
+      }
+    }
+  }
+
+  bool has_cross_engine = !external_tables.empty();
+  if (has_cross_engine) {
+    for (TABLE_LIST *tbl : external_tables)
+      register_external_table_names(tbl);
+  }
+
+  // Passively check for failure within DuckDB by running EXPLAIN.
+  // This verifies syntax, column binding, and function translation.
+  auto result = con->Query("EXPLAIN " + sql);
+  bool success = result && !result->HasError();
+
+  if (has_cross_engine) {
+    myparquet::clear_external_tables();
+  }
+
+  for (const auto &view_name : temp_views) {
+    con->Query("DROP VIEW IF EXISTS " + parquet::QuoteIdentifier(view_name));
+  }
+
+  return success;
+}
+
 select_handler *create_duckdb_select_handler(THD *thd,
                                              SELECT_LEX *sel_lex,
                                              SELECT_LEX_UNIT *sel_unit)
@@ -400,6 +466,9 @@ select_handler *create_duckdb_select_handler(THD *thd,
   std::vector<TABLE_LIST *> parquet_tables;
   std::vector<TABLE_LIST *> external_tables;
   if (!can_pushdown_to_parquet(sel_lex, parquet_tables, external_tables))
+    return nullptr;
+
+  if (!is_duckdb_pushdown_supported(thd, sel_lex, parquet_tables, external_tables))
     return nullptr;
 
   auto *handler = new ha_parquet_select_handler(thd, sel_lex, sel_unit);

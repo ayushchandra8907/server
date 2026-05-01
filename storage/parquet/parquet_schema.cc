@@ -46,39 +46,67 @@ void SetError(std::string *error, const std::string &message)
   }
 }
 
-bool MariaDBFieldToIcebergType(Field *field, json *iceberg_type,
-                               std::string *error)
-{
-  if (field == nullptr || iceberg_type == nullptr) {
-    SetError(error, "invalid field while mapping Iceberg schema");
-    return false;
+struct RichTypeDescriptor {
+  enum class Base {
+    TINYINT,
+    SMALLINT,
+    INTEGER,
+    BIGINT,
+    FLOAT,
+    DOUBLE,
+    DECIMAL,
+    VARCHAR,
+    BLOB,
+    DATE,
+    TIME,
+    TIMESTAMP,
+    BOOLEAN,
+    UNSUPPORTED
+  };
+
+  Base base = Base::UNSUPPORTED;
+  bool is_unsigned = false;
+  uint32_t precision = 0;
+  uint32_t scale = 0;
+};
+
+RichTypeDescriptor GetRichTypeDescriptor(Field *field, std::string *error) {
+  RichTypeDescriptor desc;
+  if (field == nullptr) {
+    SetError(error, "invalid field");
+    return desc;
   }
+  desc.is_unsigned = field->is_unsigned();
 
   switch (field->type()) {
     case MYSQL_TYPE_TINY:
+      desc.base = RichTypeDescriptor::Base::TINYINT;
+      break;
     case MYSQL_TYPE_SHORT:
+      desc.base = RichTypeDescriptor::Base::SMALLINT;
+      break;
     case MYSQL_TYPE_INT24:
     case MYSQL_TYPE_LONG:
-    case MYSQL_TYPE_YEAR:
-      *iceberg_type = "int";
-      return true;
+      desc.base = RichTypeDescriptor::Base::INTEGER;
+      break;
     case MYSQL_TYPE_LONGLONG:
-      *iceberg_type = "long";
-      return true;
+      desc.base = RichTypeDescriptor::Base::BIGINT;
+      break;
     case MYSQL_TYPE_FLOAT:
-      *iceberg_type = "float";
-      return true;
+      desc.base = RichTypeDescriptor::Base::FLOAT;
+      break;
     case MYSQL_TYPE_DOUBLE:
-      *iceberg_type = "double";
-      return true;
+      desc.base = RichTypeDescriptor::Base::DOUBLE;
+      break;
     case MYSQL_TYPE_DECIMAL:
     case MYSQL_TYPE_NEWDECIMAL: {
+      desc.base = RichTypeDescriptor::Base::DECIMAL;
       uint32 precision = field->field_length;
       const uint32 scale = field->decimals();
       if (scale > 0 && precision > 0) {
         precision--; // Display length includes the decimal point.
       }
-      if (!field->is_unsigned() && precision > 0) {
+      if (!desc.is_unsigned && precision > 0) {
         precision--; // Display length may include the sign.
       }
       if (precision < scale + 1) {
@@ -87,40 +115,101 @@ bool MariaDBFieldToIcebergType(Field *field, json *iceberg_type,
       if (precision > 38) {
         precision = 38;
       }
-      *iceberg_type = {{"type", "decimal"},
-                       {"precision", precision},
-                       {"scale", scale}};
-      return true;
+      desc.precision = precision;
+      desc.scale = scale;
+      break;
     }
     case MYSQL_TYPE_VARCHAR:
     case MYSQL_TYPE_VAR_STRING:
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
-      *iceberg_type = "string";
-      return true;
+      desc.base = RichTypeDescriptor::Base::VARCHAR;
+      break;
     case MYSQL_TYPE_TINY_BLOB:
     case MYSQL_TYPE_MEDIUM_BLOB:
     case MYSQL_TYPE_LONG_BLOB:
     case MYSQL_TYPE_BLOB:
-      *iceberg_type = (field->charset() == &my_charset_bin) ? json("binary")
-                                                            : json("string");
-      return true;
+      desc.base = (field->charset() == &my_charset_bin) ? RichTypeDescriptor::Base::BLOB
+                                                        : RichTypeDescriptor::Base::VARCHAR;
+      break;
     case MYSQL_TYPE_DATE:
     case MYSQL_TYPE_NEWDATE:
-      *iceberg_type = "date";
-      return true;
+      desc.base = RichTypeDescriptor::Base::DATE;
+      break;
     case MYSQL_TYPE_TIME:
     case MYSQL_TYPE_TIME2:
-      *iceberg_type = "time";
-      return true;
+      desc.base = RichTypeDescriptor::Base::TIME;
+      break;
     case MYSQL_TYPE_DATETIME:
     case MYSQL_TYPE_DATETIME2:
     case MYSQL_TYPE_TIMESTAMP:
     case MYSQL_TYPE_TIMESTAMP2:
+      desc.base = RichTypeDescriptor::Base::TIMESTAMP;
+      break;
+    case MYSQL_TYPE_YEAR:
+      desc.base = RichTypeDescriptor::Base::SMALLINT;
+      desc.is_unsigned = true;
+      break;
+    case MYSQL_TYPE_BIT:
+      desc.base = RichTypeDescriptor::Base::BOOLEAN;
+      break;
+    default:
+      SetError(error, "unsupported MariaDB column type");
+      break;
+  }
+  return desc;
+}
+
+bool MariaDBFieldToIcebergType(Field *field, json *iceberg_type,
+                               std::string *error)
+{
+  if (field == nullptr || iceberg_type == nullptr) {
+    SetError(error, "invalid field while mapping Iceberg schema");
+    return false;
+  }
+
+  auto desc = GetRichTypeDescriptor(field, error);
+  if (desc.base == RichTypeDescriptor::Base::UNSUPPORTED) {
+    return false;
+  }
+
+  switch (desc.base) {
+    case RichTypeDescriptor::Base::TINYINT:
+    case RichTypeDescriptor::Base::SMALLINT:
+    case RichTypeDescriptor::Base::INTEGER:
+      *iceberg_type = "int";
+      return true;
+    case RichTypeDescriptor::Base::BIGINT:
+      *iceberg_type = "long";
+      return true;
+    case RichTypeDescriptor::Base::FLOAT:
+      *iceberg_type = "float";
+      return true;
+    case RichTypeDescriptor::Base::DOUBLE:
+      *iceberg_type = "double";
+      return true;
+    case RichTypeDescriptor::Base::DECIMAL:
+      *iceberg_type = {{"type", "decimal"},
+                       {"precision", desc.precision},
+                       {"scale", desc.scale}};
+      return true;
+    case RichTypeDescriptor::Base::VARCHAR:
+      *iceberg_type = "string";
+      return true;
+    case RichTypeDescriptor::Base::BLOB:
+      *iceberg_type = "binary";
+      return true;
+    case RichTypeDescriptor::Base::DATE:
+      *iceberg_type = "date";
+      return true;
+    case RichTypeDescriptor::Base::TIME:
+      *iceberg_type = "time";
+      return true;
+    case RichTypeDescriptor::Base::TIMESTAMP:
       *iceberg_type = "timestamp";
       return true;
-    case MYSQL_TYPE_BIT:
+    case RichTypeDescriptor::Base::BOOLEAN:
       *iceberg_type = "boolean";
       return true;
     default:
@@ -171,61 +260,49 @@ bool MariaDBFieldToDuckDBType(Field *field, std::string *duckdb_type,
     return false;
   }
 
-  switch (field->type()) {
-    case MYSQL_TYPE_TINY:
-      *duckdb_type = "TINYINT";
+  auto desc = GetRichTypeDescriptor(field, error);
+  if (desc.base == RichTypeDescriptor::Base::UNSUPPORTED) {
+    return false;
+  }
+
+  switch (desc.base) {
+    case RichTypeDescriptor::Base::TINYINT:
+      *duckdb_type = desc.is_unsigned ? "UTINYINT" : "TINYINT";
       return true;
-    case MYSQL_TYPE_SHORT:
-      *duckdb_type = "SMALLINT";
+    case RichTypeDescriptor::Base::SMALLINT:
+      *duckdb_type = desc.is_unsigned ? "USMALLINT" : "SMALLINT";
       return true;
-    case MYSQL_TYPE_INT24:
-    case MYSQL_TYPE_LONG:
-      *duckdb_type = "INTEGER";
+    case RichTypeDescriptor::Base::INTEGER:
+      *duckdb_type = desc.is_unsigned ? "UINTEGER" : "INTEGER";
       return true;
-    case MYSQL_TYPE_LONGLONG:
-      *duckdb_type = "BIGINT";
+    case RichTypeDescriptor::Base::BIGINT:
+      *duckdb_type = desc.is_unsigned ? "UBIGINT" : "BIGINT";
       return true;
-    case MYSQL_TYPE_FLOAT:
+    case RichTypeDescriptor::Base::FLOAT:
       *duckdb_type = "FLOAT";
       return true;
-    case MYSQL_TYPE_DOUBLE:
+    case RichTypeDescriptor::Base::DOUBLE:
       *duckdb_type = "DOUBLE";
       return true;
-    case MYSQL_TYPE_DECIMAL:
-    case MYSQL_TYPE_NEWDECIMAL:
-      *duckdb_type = "DECIMAL";
+    case RichTypeDescriptor::Base::DECIMAL:
+      *duckdb_type = "DECIMAL(" + std::to_string(desc.precision) + ", " + std::to_string(desc.scale) + ")";
       return true;
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_VAR_STRING:
-    case MYSQL_TYPE_STRING:
-    case MYSQL_TYPE_ENUM:
-    case MYSQL_TYPE_SET:
+    case RichTypeDescriptor::Base::VARCHAR:
       *duckdb_type = "VARCHAR";
       return true;
-    case MYSQL_TYPE_TINY_BLOB:
-    case MYSQL_TYPE_MEDIUM_BLOB:
-    case MYSQL_TYPE_LONG_BLOB:
-    case MYSQL_TYPE_BLOB:
-      *duckdb_type = (field->charset() == &my_charset_bin) ? "BLOB" : "VARCHAR";
+    case RichTypeDescriptor::Base::BLOB:
+      *duckdb_type = "BLOB";
       return true;
-    case MYSQL_TYPE_DATE:
-    case MYSQL_TYPE_NEWDATE:
+    case RichTypeDescriptor::Base::DATE:
       *duckdb_type = "DATE";
       return true;
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_TIME2:
+    case RichTypeDescriptor::Base::TIME:
       *duckdb_type = "TIME";
       return true;
-    case MYSQL_TYPE_DATETIME:
-    case MYSQL_TYPE_DATETIME2:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_TIMESTAMP2:
+    case RichTypeDescriptor::Base::TIMESTAMP:
       *duckdb_type = "TIMESTAMP";
       return true;
-    case MYSQL_TYPE_YEAR:
-      *duckdb_type = "SMALLINT";
-      return true;
-    case MYSQL_TYPE_BIT:
+    case RichTypeDescriptor::Base::BOOLEAN:
       *duckdb_type = "BOOLEAN";
       return true;
     default:
@@ -443,12 +520,15 @@ bool StoreDuckDBValueInMariaDBField(Field *field, duckdb::Value &value,
       case MYSQL_TYPE_MEDIUM_BLOB:
       case MYSQL_TYPE_LONG_BLOB:
       case MYSQL_TYPE_BLOB:
-      case MYSQL_TYPE_GEOMETRY:
-      case MYSQL_TYPE_BIT: {
+      case MYSQL_TYPE_GEOMETRY: {
         auto str = value.GetValueUnsafe<duckdb::string>();
         field->store(str.c_str(), str.size(), &my_charset_bin);
         return true;
       }
+      case MYSQL_TYPE_BIT:
+        field->store(static_cast<longlong>(value.GetValue<bool>() ? 1 : 0),
+                     true);
+        return true;
       case MYSQL_TYPE_VARCHAR:
       case MYSQL_TYPE_STRING:
       case MYSQL_TYPE_VAR_STRING: {

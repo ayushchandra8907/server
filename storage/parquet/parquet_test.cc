@@ -7,6 +7,7 @@
   #include "field.h"
   #include "sql_type.h"
   #include "parquet_catalog.h"
+  #include "parquet_create.h"
   #include "parquet_iceberg.h"
   #include "parquet_metadata.h"
   #include "parquet_object_store.h"
@@ -15,6 +16,7 @@
   #include "parquet_transaction.h"
 
   #include <cstdio>
+  #include <fstream>
   #include <string>
   #include <tap.h>
 
@@ -106,6 +108,57 @@ static void test_build_query_blob_mapping()
   ok(parquet::BuildDuckDBCreateTableSql("files", &table, &query, &error) &&
          query == "CREATE TABLE IF NOT EXISTS \"files\" (\"payload\" BLOB)",
      "build_query maps binary blob columns to BLOB");
+}
+
+static void test_build_query_bit_mapping()
+{
+  LEX_CSTRING flag_name= {STRING_WITH_LEN("flag")};
+  uchar record[1]= {0};
+  uchar bit_storage= 0;
+
+  TABLE table{};
+  TABLE_SHARE share{};
+  table.s= &share;
+
+  Field_bit flag_field(record, 1, nullptr, 0, &bit_storage, 0, Field::NONE,
+                       &flag_name);
+
+  Field *fields[]= {&flag_field, nullptr};
+  share.field= fields;
+
+  std::string query;
+  std::string schema_json;
+  std::string error;
+  ok(parquet::BuildDuckDBCreateTableSql("flags", &table, &query, &error) &&
+         query == "CREATE TABLE IF NOT EXISTS \"flags\" (\"flag\" BOOLEAN)" &&
+         parquet::BuildIcebergSchemaJson(&table, 0, &schema_json, &error) &&
+         schema_json.find("\"name\":\"flag\"") != std::string::npos &&
+         schema_json.find("\"type\":\"boolean\"") != std::string::npos,
+     "BIT columns map to DuckDB BOOLEAN and Iceberg boolean");
+}
+
+static void test_store_duckdb_boolean_in_bit_field()
+{
+  LEX_CSTRING flag_name= {STRING_WITH_LEN("flag")};
+  uchar record[1]= {0};
+  uchar bit_storage= 0;
+  Field_bit flag_field(record, 1, nullptr, 0, &bit_storage, 0, Field::NONE,
+                       &flag_name);
+
+  duckdb::Value true_value= duckdb::Value::BOOLEAN(true);
+  duckdb::Value false_value= duckdb::Value::BOOLEAN(false);
+  std::string error;
+  const bool stored_true=
+      parquet::StoreDuckDBValueInMariaDBField(&flag_field, true_value, nullptr,
+                                              &error) &&
+      flag_field.val_int() == 1;
+  const bool stored_false=
+      parquet::StoreDuckDBValueInMariaDBField(&flag_field, false_value, nullptr,
+                                              &error) &&
+      flag_field.val_int() == 0;
+
+  ok(stored_true && stored_false,
+     "BIT readback stores DuckDB BOOLEAN values numerically");
 }
 
 static void test_build_iceberg_schema_json()
@@ -397,6 +450,173 @@ static void test_build_s3_uri_and_absolute_location()
      "absolute object resolution keeps bucket and full object key intact");
 }
 
+static void test_configured_table_location_uri()
+{
+  parquet::ObjectStoreConfig config;
+  config.endpoint = "https://minio.local:9000";
+  config.bucket = "warehouse";
+  config.key_prefix = "/configured/root/";
+
+  std::string location_uri;
+  std::string error;
+  ok(parquet::BuildConfiguredTableLocationUri(config, &location_uri, &error) &&
+         location_uri == "s3://warehouse/configured/root",
+     "configured table location URI is derived from object store root");
+}
+
+static void test_catalog_load_reconciles_table_location()
+{
+  parquet::TableMetadata metadata;
+  metadata.object_store_config.endpoint = "https://minio.local:9000";
+  metadata.object_store_config.bucket = "configured-bucket";
+  metadata.object_store_config.key_prefix = "configured/root";
+
+  parquet::CatalogLoadTableResult load_result;
+  load_result.metadata.table_uuid = "table-uuid";
+  load_result.metadata.table_location = "s3://catalog-bucket/catalog/root/";
+
+  std::string error;
+  ok(parquet::ApplyCatalogLoadResult(&metadata, load_result, &error) &&
+         metadata.table_uuid == "table-uuid" &&
+         metadata.table_location == "s3://catalog-bucket/catalog/root" &&
+         metadata.object_store_config.bucket == "catalog-bucket" &&
+         metadata.object_store_config.key_prefix == "catalog/root" &&
+         metadata.object_store_config.endpoint == "https://minio.local:9000",
+     "catalog load reconciles object store root with table location");
+}
+
+static void test_runtime_table_location_reconciles_sidecar()
+{
+  PluginConfigGuard guard;
+  set_test_plugin_config();
+
+  parquet::TableMetadata metadata;
+  metadata.local_paths = parquet::ResolveLocalPaths("/tmp/runtime_location");
+  metadata.metadata_file_path =
+      parquet::ResolveMetadataFilePath(metadata.local_paths.table_path.c_str());
+  metadata.catalog_enabled = true;
+  metadata.object_store_enabled = true;
+  metadata.catalog_config.base_uri = "http://custom/catalog/v1/";
+  metadata.catalog_table_ident.table_name = "runtime_location";
+  metadata.object_store_config.endpoint = "https://minio.local:9000";
+  metadata.object_store_config.bucket = "configured-bucket";
+  metadata.object_store_config.key_prefix = "configured/root";
+  metadata.table_location = "s3://catalog-bucket/catalog/root";
+
+  std::string error;
+  ok(parquet::SaveTableMetadata(metadata, &error),
+     "stale table-location sidecar saves before reconciliation");
+
+  parquet::TableMetadata resolved;
+  ok(parquet::ResolveRuntimeTableMetadata(
+         metadata.local_paths.table_path.c_str(), &resolved, &error) &&
+         resolved.table_location == "s3://catalog-bucket/catalog/root" &&
+         resolved.object_store_config.bucket == "catalog-bucket" &&
+         resolved.object_store_config.key_prefix == "catalog/root" &&
+         resolved.object_store_config.credentials.access_key_id == "minio",
+     "runtime metadata reconciles stale object store root from table location");
+
+  std::remove(metadata.metadata_file_path.c_str());
+}
+
+static void test_table_object_location_prefers_table_location()
+{
+  parquet::TableMetadata metadata;
+  metadata.object_store_config.endpoint = "https://minio.local:9000";
+  metadata.object_store_config.bucket = "configured-bucket";
+  metadata.object_store_config.key_prefix = "configured/root";
+  metadata.table_location = "s3://catalog-bucket/catalog/root";
+
+  parquet::ObjectLocation location;
+  std::string error;
+  ok(parquet::ResolveTableObjectLocation(
+         metadata, "data/part-1.parquet", &location, &error) &&
+         location.bucket == "catalog-bucket" &&
+         location.key == "catalog/root/data/part-1.parquet" &&
+         location.url ==
+             "https://minio.local:9000/catalog-bucket/"
+             "catalog/root/data/part-1.parquet",
+     "table object location prefers catalog table location");
+
+  metadata.table_location.clear();
+  ok(parquet::ResolveTableObjectLocation(
+         metadata, "data/part-1.parquet", &location, &error) &&
+         location.bucket == "configured-bucket" &&
+         location.key == "configured/root/data/part-1.parquet",
+     "table object location falls back to configured object root");
+}
+
+static void test_table_location_rejects_non_s3()
+{
+  parquet::TableMetadata metadata;
+  metadata.table_location = "file:///tmp/table";
+
+  std::string error;
+  ok(!parquet::ReconcileObjectStoreConfigWithTableLocation(&metadata, &error) &&
+         error.find("s3:// URI") != std::string::npos,
+     "non-S3 table locations are rejected before object writes");
+}
+
+static void test_iceberg_manifest_locations_use_table_location()
+{
+  parquet::TableMetadata table_metadata;
+  table_metadata.local_paths =
+      parquet::ResolveLocalPaths("/tmp/iceberg_location_root");
+  table_metadata.metadata_file_path = parquet::ResolveMetadataFilePath(
+      table_metadata.local_paths.table_path.c_str());
+  table_metadata.catalog_enabled = true;
+  table_metadata.object_store_enabled = true;
+  table_metadata.object_store_config.endpoint = "https://minio.local:9000";
+  table_metadata.object_store_config.bucket = "configured-bucket";
+  table_metadata.object_store_config.key_prefix = "configured/root";
+  table_metadata.table_uuid = "c3163f0d-b617-4d47-bfab-8f5312fdc810";
+  table_metadata.table_location = "s3://warehouse/catalog/root";
+
+  parquet::CatalogLoadTableResult load_result;
+  load_result.metadata.table_uuid = table_metadata.table_uuid;
+  load_result.metadata.format_version = 2;
+  load_result.metadata.raw_metadata_json =
+      R"json({
+        "format-version": 2,
+        "table-uuid": "c3163f0d-b617-4d47-bfab-8f5312fdc810",
+        "current-schema-id": 0,
+        "schemas": [{
+          "type": "struct",
+          "schema-id": 0,
+          "identifier-field-ids": [],
+          "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        }],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-sequence-number": 0
+      })json";
+
+  std::vector<parquet::ParquetStagedFile> staged_files = {{
+      "/tmp/iceberg_location_root",
+      "users",
+      "/tmp/iceberg_location_root.stage_1.parquet",
+      "s3://warehouse/catalog/root/data/flush_1.parquet",
+      3,
+      128,
+      1,
+  }};
+
+  parquet::IcebergCommitArtifacts artifacts;
+  std::string error;
+  ok(parquet::BuildIcebergCommitArtifacts(table_metadata, load_result,
+                                          staged_files, &artifacts, &error) &&
+         artifacts.manifest_location.bucket == "warehouse" &&
+         artifacts.manifest_location.key.rfind("catalog/root/metadata/", 0) ==
+             0 &&
+         artifacts.manifest_list_location.bucket == "warehouse" &&
+         artifacts.manifest_list_location.key.rfind(
+             "catalog/root/metadata/", 0) == 0,
+     "Iceberg manifest locations use catalog table location");
+
+  std::remove(artifacts.manifest_local_path.c_str());
+  std::remove(artifacts.manifest_list_local_path.c_str());
+}
+
 static void test_metadata_roundtrip()
 {
   parquet::TableMetadata metadata;
@@ -420,6 +640,7 @@ static void test_metadata_roundtrip()
   metadata.table_uuid= "9d4796f7-3c97-4f4f-b1af-3b87b77b4d53";
   metadata.table_location= "s3://warehouse/iceberg/analytics/users";
   metadata.current_snapshot_id= "12345";
+  metadata.raw_catalog_metadata_json= R"json({"format-version":2})json";
   metadata.active_files= {{
       "s3://warehouse/iceberg/analytics/users/data/flush_1.parquet",
       7,
@@ -446,6 +667,7 @@ static void test_metadata_roundtrip()
          loaded.current_snapshot_id == "12345" &&
          loaded.active_files.size() == 1 &&
          loaded.active_files[0].record_count == 7 &&
+         loaded.raw_catalog_metadata_json == R"json({"format-version":2})json" &&
          loaded.catalog_config.bearer_token.empty() &&
          loaded.object_store_config.credentials.empty() &&
          loaded.active_scan_paths.size() == 1 &&
@@ -570,13 +792,118 @@ static void test_resolve_scan_paths_from_sidecar()
      "scan path resolver reads active_scan_paths without catalog fallback");
 }
 
+static void test_resolve_scan_paths_from_active_files()
+{
+  parquet::TableMetadata metadata;
+  metadata.current_snapshot_id = "8";
+  metadata.active_files = {{
+      "s3://warehouse/db/t1/data/part-1.parquet", 3, 111, "8", 4, 4},
+      {"s3://warehouse/db/t1/data/part-2.parquet", 5, 222, "8", 5, 5},
+  };
+
+  std::vector<std::string> paths;
+  std::string error;
+  ok(resolve_parquet_scan_paths(&metadata, &paths, &error) &&
+         paths.size() == 2 &&
+         paths[0] == "s3://warehouse/db/t1/data/part-1.parquet" &&
+         paths[1] == "s3://warehouse/db/t1/data/part-2.parquet" &&
+         metadata.active_scan_paths == paths,
+     "scan path resolver derives paths from active file lineage");
+}
+
+static void test_resolve_scan_paths_empty_table()
+{
+  parquet::TableMetadata metadata;
+
+  std::vector<std::string> paths;
+  std::string error;
+  ok(resolve_parquet_scan_paths(&metadata, &paths, &error) &&
+         paths.empty(),
+     "scan path resolver treats sidecars without snapshots as empty tables");
+}
+
 static void test_legacy_manifest_list_extraction()
 {
-  auto paths = extract_manifest_paths(
+  auto paths = extract_legacy_fake_manifest_list_scan_paths(
       R"json({"metadata":{"snapshots":[{"manifest-list":"s3://warehouse/db/t1/data/legacy.parquet"}]}})json");
   ok(paths.size() == 1 &&
          paths[0] == "s3://warehouse/db/t1/data/legacy.parquet",
      "legacy fake manifest-list extraction remains isolated outside handler");
+
+  paths = extract_legacy_fake_manifest_list_scan_paths(
+      R"json({"metadata":{"snapshots":[{"manifest-list":"s3://warehouse/db/t1/metadata/snap-1.avro"}]}})json");
+  ok(paths.empty(),
+     "legacy fake manifest-list extraction ignores real Iceberg Avro manifest lists");
+}
+
+static void test_resolve_scan_paths_from_legacy_raw_metadata()
+{
+  parquet::TableMetadata metadata;
+  metadata.local_paths = parquet::ResolveLocalPaths("/tmp/parquet_legacy_raw");
+  metadata.metadata_file_path =
+      parquet::ResolveMetadataFilePath(metadata.local_paths.table_path.c_str());
+  metadata.current_snapshot_id = "7";
+  metadata.raw_catalog_metadata_json =
+      R"json({"metadata":{"snapshots":[{"manifest-list":"s3://warehouse/db/t1/data/legacy.parquet"}]}})json";
+  std::remove(metadata.metadata_file_path.c_str());
+
+  std::vector<std::string> paths;
+  std::string error;
+  ok(resolve_parquet_scan_paths(&metadata, &paths, &error) &&
+         paths.size() == 1 &&
+         paths[0] == "s3://warehouse/db/t1/data/legacy.parquet" &&
+         metadata.active_scan_paths == paths &&
+         metadata.active_files.size() == 1 &&
+         metadata.active_files[0].snapshot_id == "7",
+     "scan path resolver migrates legacy raw metadata from the sidecar");
+
+  parquet::TableMetadata loaded;
+  ok(parquet::LoadTableMetadata(metadata.local_paths.table_path.c_str(),
+                                &loaded, &error) &&
+         loaded.active_scan_paths.size() == 1 &&
+         loaded.active_scan_paths[0] ==
+             "s3://warehouse/db/t1/data/legacy.parquet",
+     "legacy scan path migration persists active_scan_paths");
+  std::remove(metadata.metadata_file_path.c_str());
+}
+
+static void test_resolve_scan_paths_rejects_missing_lineage()
+{
+  parquet::TableMetadata metadata;
+  metadata.current_snapshot_id = "9";
+
+  std::vector<std::string> paths;
+  std::string error;
+  ok(!resolve_parquet_scan_paths(&metadata, &paths, &error) &&
+         error.find("lacks scan lineage") != std::string::npos,
+     "scan path resolver rejects current snapshots without sidecar lineage");
+}
+
+static void test_create_cleanup_removes_local_artifacts()
+{
+  parquet::TableMetadata metadata;
+  metadata.local_paths = parquet::ResolveLocalPaths("/tmp/parquet_create_cleanup");
+  metadata.metadata_file_path =
+      parquet::ResolveMetadataFilePath(metadata.local_paths.table_path.c_str());
+
+  {
+    std::ofstream parquet_file(metadata.local_paths.parquet_file_path,
+                               std::ios::binary | std::ios::trunc);
+    parquet_file << "stale parquet seed";
+  }
+  {
+    std::ofstream sidecar_file(metadata.metadata_file_path,
+                              std::ios::binary | std::ios::trunc);
+    sidecar_file << "{}";
+  }
+
+  parquet::RemoveCreateLocalArtifacts(metadata);
+
+  std::ifstream parquet_file(metadata.local_paths.parquet_file_path,
+                             std::ios::binary);
+  std::ifstream sidecar_file(metadata.metadata_file_path, std::ios::binary);
+  ok(!parquet_file.good() && !sidecar_file.good(),
+     "create cleanup removes local seed and sidecar artifacts");
 }
 
 static void test_build_iceberg_commit_artifacts()
@@ -663,10 +990,12 @@ static void test_build_iceberg_commit_artifacts()
 
 int main()
 {
-  plan(39);
+  plan(56);
 
   test_build_query_basic_schema();
   test_build_query_blob_mapping();
+  test_build_query_bit_mapping();
+  test_store_duckdb_boolean_in_bit_field();
   test_build_iceberg_schema_json();
   test_default_table_options();
   test_local_path_resolution();
@@ -687,13 +1016,24 @@ int main()
   test_parse_catalog_connection();
   test_parse_catalog_connection_rejects_bearer_token();
   test_build_s3_uri_and_absolute_location();
+  test_configured_table_location_uri();
+  test_catalog_load_reconciles_table_location();
+  test_runtime_table_location_reconciles_sidecar();
+  test_table_object_location_prefers_table_location();
+  test_table_location_rejects_non_s3();
+  test_iceberg_manifest_locations_use_table_location();
   test_metadata_roundtrip();
   test_metadata_sidecar_exists();
   test_resolve_create_table_metadata_merges_defaults();
   test_runtime_defaults_merge();
   test_extract_active_scan_paths();
   test_resolve_scan_paths_from_sidecar();
+  test_resolve_scan_paths_from_active_files();
+  test_resolve_scan_paths_empty_table();
   test_legacy_manifest_list_extraction();
+  test_resolve_scan_paths_from_legacy_raw_metadata();
+  test_resolve_scan_paths_rejects_missing_lineage();
+  test_create_cleanup_removes_local_artifacts();
   test_build_iceberg_commit_artifacts();
 
   return exit_status();

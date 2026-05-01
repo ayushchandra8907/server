@@ -42,6 +42,7 @@ MYSQL_ADD_PLUGIN(parquet
   parquet_shared.cc
   parquet_schema.cc
   parquet_catalog.cc
+  parquet_create.cc
   parquet_iceberg.cc
   parquet_metadata.cc
   parquet_object_store.cc
