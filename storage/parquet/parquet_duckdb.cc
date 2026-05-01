@@ -511,17 +511,6 @@ bool MaterializeLocalDataFile(ParquetTableTxnState *table_state,
       return false;
     }
 
-    const std::string metadata_query =
-        "SELECT SUM(total_compressed_size) FROM parquet_metadata(" +
-        quote_string_literal(local_data_path) + ")";
-    parquet_log_info("DuckDB query [commit/local-metadata] " +
-                     parquet_log_preview(metadata_query));
-    auto metadata_result = connection->Query(metadata_query);
-    if (metadata_result && !metadata_result->HasError() &&
-        metadata_result->RowCount() > 0 &&
-        !metadata_result->GetValue(0, 0).IsNull()) {
-      file_size = metadata_result->GetValue(0, 0).GetValue<uint64_t>();
-    }
   } catch (const std::exception &ex) {
     if (error != nullptr) {
       *error = ex.what();
@@ -529,9 +518,7 @@ bool MaterializeLocalDataFile(ParquetTableTxnState *table_state,
     return false;
   }
 
-  if (file_size == 0) {
-    file_size = ReadLocalFileSize(local_data_path);
-  }
+  file_size = ReadLocalFileSize(local_data_path);
 
   *staged_file = {table_state->table_path,
                   table_state->table_name,

@@ -513,11 +513,7 @@ bool BuildExistingManifestEntries(const TableMetadata &table_metadata,
   }
 
   if (table_metadata.active_files.empty()) {
-    if (error != nullptr) {
-      *error =
-          "existing Iceberg snapshots require active file lineage in the sidecar";
-    }
-    return false;
+    return true;
   }
 
   for (const auto &active_file : table_metadata.active_files) {
