@@ -82,14 +82,7 @@ public:
 
 private:
  THR_LOCK_DATA lock;
- std::string helper_db_path;
  std::string parquet_file_path;
-
-
- bool duckdb_initialized;
- //duckdb::DuckDB *db = nullptr;
- //duckdb::Connection *con = nullptr;
-
 
  std::string pushed_cond_sql;
  bool has_pushed_cond = false;

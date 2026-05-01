@@ -5,11 +5,13 @@
 
 #include "duckdb.hpp"
 
+#include <curl/curl.h>
 #include <string>
 #include <vector>
 
 namespace parquet
 {
+struct CatalogClientConfig;
 struct ObjectStoreConfig;
 struct TableMetadata;
 }
@@ -50,6 +52,11 @@ bool configure_duckdb_s3(duckdb::Connection *con,
                          const parquet::ObjectStoreConfig &config,
                          std::string *error);
 
+void apply_catalog_auth_header(const parquet::CatalogClientConfig &config,
+                               struct curl_slist **headers);
+void apply_catalog_curl_options(CURL *curl,
+                                const parquet::CatalogClientConfig &config);
+
 std::string lakekeeper_table_collection_url(
     const parquet::TableMetadata &metadata);
 std::string lakekeeper_table_url(const parquet::TableMetadata &metadata);
@@ -65,7 +72,4 @@ bool fetch_lakekeeper_table_metadata(const parquet::TableMetadata &metadata,
 bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
                                 std::vector<std::string> *s3_files,
                                 long *http_code = nullptr);
-std::string fetch_current_snapshot_data_file(
-    const parquet::TableMetadata &metadata);
-
 #endif

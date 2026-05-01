@@ -95,26 +95,6 @@ std::string namespace_path_from_metadata(const parquet::TableMetadata &metadata)
       metadata.catalog_table_ident.namespace_ident, "%1F");
 }
 
-void apply_catalog_auth_header(const parquet::CatalogClientConfig &config,
-                               struct curl_slist **headers)
-{
-  if (headers == nullptr || config.bearer_token.empty())
-    return;
-
-  *headers = curl_slist_append(
-      *headers, ("Authorization: Bearer " + config.bearer_token).c_str());
-}
-
-void apply_catalog_curl_options(CURL *curl,
-                                const parquet::CatalogClientConfig &config)
-{
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout_ms);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, config.timeout_ms);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, config.verify_peer ? 1L : 0L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, config.verify_host ? 2L : 0L);
-}
-
 std::string duckdb_s3_endpoint_setting(const std::string &endpoint)
 {
   auto trimmed = trim_copy(endpoint);
@@ -154,6 +134,26 @@ std::string duckdb_s3_url_style(const std::string &url_style)
 }
 
 } // namespace
+
+void apply_catalog_auth_header(const parquet::CatalogClientConfig &config,
+                               struct curl_slist **headers)
+{
+  if (headers == nullptr || config.bearer_token.empty())
+    return;
+
+  *headers = curl_slist_append(
+      *headers, ("Authorization: Bearer " + config.bearer_token).c_str());
+}
+
+void apply_catalog_curl_options(CURL *curl,
+                                const parquet::CatalogClientConfig &config)
+{
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, config.connect_timeout_ms);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, config.timeout_ms);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, config.verify_peer ? 1L : 0L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, config.verify_host ? 2L : 0L);
+}
 
 ParquetPluginConfigSnapshot parquet_plugin_config_snapshot()
 {
@@ -444,14 +444,3 @@ bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
   return true;
 }
 
-std::string fetch_current_snapshot_data_file(
-    const parquet::TableMetadata &metadata)
-{
-  std::vector<std::string> s3_files;
-  long http_code = 0;
-  if (!resolve_parquet_data_files(metadata, &s3_files, &http_code))
-    return "";
-  if (http_code != 200 || s3_files.empty())
-    return "";
-  return s3_files.front();
-}
