@@ -17,15 +17,16 @@ set @@parquet_s3_access_key_id='other-access';
 ERROR HY000: Variable 'parquet_s3_access_key_id' is a read only variable
 set @@parquet_lakekeeper_bearer_token='other-token';
 ERROR HY000: Variable 'parquet_lakekeeper_bearer_token' is a read only variable
-create database if not exists test;
+drop database if exists test;
+create database test;
 use test;
 create table t_secret_conn (
-  id int
+id int
 ) engine=parquet
-  connection='endpoint=https://minio.local:9000;bucket=warehouse;access_key_id=bad';
+connection='endpoint=https://minio.local:9000;bucket=warehouse;access_key_id=bad';
 ERROR HY000: CONNECTION must not include access_key_id=...; use parquet plugin variables for secrets
 create table t_secret_catalog (
-  id int
+id int
 ) engine=parquet
-  catalog='uri=http://127.0.0.1:8181/catalog/v1/;bearer_token=bad';
+catalog='uri=http://127.0.0.1:8181/catalog/v1/;bearer_token=bad';
 ERROR HY000: CATALOG must not include bearer_token=...; use parquet plugin variables for secrets

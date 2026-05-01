@@ -5,13 +5,12 @@
 
 #include "duckdb.hpp"
 
-#include <curl/curl.h>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace parquet
 {
-struct CatalogClientConfig;
 struct ObjectStoreConfig;
 struct TableMetadata;
 }
@@ -52,24 +51,11 @@ bool configure_duckdb_s3(duckdb::Connection *con,
                          const parquet::ObjectStoreConfig &config,
                          std::string *error);
 
-void apply_catalog_auth_header(const parquet::CatalogClientConfig &config,
-                               struct curl_slist **headers);
-void apply_catalog_curl_options(CURL *curl,
-                                const parquet::CatalogClientConfig &config);
-
-std::string lakekeeper_table_collection_url(
-    const parquet::TableMetadata &metadata);
-std::string lakekeeper_table_url(const parquet::TableMetadata &metadata);
-std::string lakekeeper_transaction_commit_url(
-    const parquet::TableMetadata &metadata);
-
 std::string table_name_from_path(const std::string &table_path);
-std::vector<std::string> extract_manifest_paths(const std::string &response_body);
+std::vector<std::string> extract_legacy_fake_manifest_list_scan_paths(
+    const std::string &response_body);
+bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
+                                std::vector<std::string> *paths,
+                                std::string *error);
 
-bool fetch_lakekeeper_table_metadata(const parquet::TableMetadata &metadata,
-                                     std::string *response_body,
-                                     long *http_code);
-bool resolve_parquet_data_files(const parquet::TableMetadata &metadata,
-                                std::vector<std::string> *s3_files,
-                                long *http_code = nullptr);
 #endif

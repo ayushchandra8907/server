@@ -130,6 +130,9 @@ struct CatalogPlanScanResult {
 };
 
 std::string NormalizeCatalogBaseUri(const std::string &base_uri);
+bool FindLakekeeperWarehouseNameById(const std::string &management_response_json,
+                                     const std::string &warehouse_id,
+                                     std::string *warehouse_name);
 CatalogCapabilitySet ResolveCatalogCapabilities(
     const std::vector<std::string> &advertised_endpoints);
 std::string EncodeNamespaceForUrlPath(const CatalogNamespaceIdent &ident,
@@ -146,9 +149,13 @@ public:
       const std::map<std::string, std::string> &properties = {});
   CatalogStatus CreateTable(const CatalogCreateTableRequest &request,
                             CatalogLoadTableResult *result);
+  CatalogStatus DropTable(const CatalogTableIdent &ident);
   CatalogStatus LoadTable(const CatalogTableIdent &ident,
                           CatalogLoadTableResult *result,
                           const std::string &access_delegation = "");
+  CatalogStatus LoadRawTableMetadata(const CatalogTableIdent &ident,
+                                     std::string *raw_metadata_json,
+                                     const std::string &access_delegation = "");
   CatalogStatus CommitTable(const CatalogCommitRequest &request,
                             CatalogLoadTableResult *result);
   CatalogStatus CommitTransactionIfSupported(

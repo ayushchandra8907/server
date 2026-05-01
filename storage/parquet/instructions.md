@@ -49,7 +49,7 @@ Add or update the `[mariadbd]` section with Parquet plugin vars:
 ```ini
 [mariadbd]
 parquet_lakekeeper_base_url=http://localhost:8181/catalog/v1/
-parquet_lakekeeper_warehouse_id=REPLACE_WITH_WAREHOUSE_UUID
+parquet_lakekeeper_warehouse_id=REPLACE_WITH_WAREHOUSE_NAME_OR_UUID
 parquet_lakekeeper_namespace=data
 parquet_lakekeeper_bearer_token=REPLACE_IF_YOU_USE_AUTH
 parquet_s3_bucket=mariadb-parquet-demo
@@ -114,9 +114,14 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
   }'
 ```
 
-Copy the returned warehouse UUID into:
+Copy the returned warehouse name or UUID into:
 
 - `parquet_lakekeeper_warehouse_id`
+
+LakeKeeper's Iceberg REST `/v1/config` endpoint expects the warehouse name
+as the bootstrap `warehouse` value and returns the UUID as the REST prefix.
+The Parquet engine also accepts the UUID here and resolves it through the
+LakeKeeper management API when needed.
 
 If your config uses `parquet_lakekeeper_namespace=data`, create it once:
 

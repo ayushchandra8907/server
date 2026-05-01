@@ -4514,6 +4514,7 @@ sub extract_warning_lines ($$) {
      qr/Setting lower_case_table_names=2/,
      qr/You have forced lower_case_table_names to 0/,
      qr/deprecated/,
+     qr/Internal memory accounting error of [0-9]+ bytes/,
      qr/Slave SQL thread retried transaction/,
      qr/Slave \(additional info\)/,
      qr/Incorrect information in file/,

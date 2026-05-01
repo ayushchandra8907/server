@@ -3,14 +3,14 @@
 #include "ha_parquet_pushdown.h"
 
 #include "parquet_cross_engine_scan.h"
+#include "parquet_duckdb.h"
 #include "parquet_metadata.h"
+#include "parquet_schema.h"
 #include "parquet_shared.h"
 
 #include "field.h"
 #include "log.h"
-#include "my_time.h"
 #include "sql_select.h"
-#include "sql_time.h"
 
 #include <algorithm>
 #include <cstring>
@@ -18,206 +18,6 @@
 #include <unordered_set>
 
 namespace {
-
-std::string quote_identifier(const std::string &identifier)
-{
-  std::string quoted = "\"";
-  for (char ch : identifier) {
-    if (ch == '"')
-      quoted += "\"\"";
-    else
-      quoted += ch;
-  }
-  quoted += "\"";
-  return quoted;
-}
-
-std::string mariadb_type_to_duckdb(Field *f)
-{
-  switch (f->type()) {
-    case MYSQL_TYPE_TINY:
-      return "TINYINT";
-    case MYSQL_TYPE_SHORT:
-      return "SMALLINT";
-    case MYSQL_TYPE_INT24:
-    case MYSQL_TYPE_LONG:
-      return "INTEGER";
-    case MYSQL_TYPE_LONGLONG:
-      return "BIGINT";
-    case MYSQL_TYPE_FLOAT:
-      return "FLOAT";
-    case MYSQL_TYPE_DOUBLE:
-      return "DOUBLE";
-    case MYSQL_TYPE_DECIMAL:
-    case MYSQL_TYPE_NEWDECIMAL:
-      return "DECIMAL";
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_VAR_STRING:
-    case MYSQL_TYPE_STRING:
-    case MYSQL_TYPE_ENUM:
-    case MYSQL_TYPE_SET:
-      return "VARCHAR";
-    case MYSQL_TYPE_TINY_BLOB:
-    case MYSQL_TYPE_MEDIUM_BLOB:
-    case MYSQL_TYPE_LONG_BLOB:
-    case MYSQL_TYPE_BLOB:
-      return (f->charset() == &my_charset_bin) ? "BLOB" : "VARCHAR";
-    case MYSQL_TYPE_DATE:
-    case MYSQL_TYPE_NEWDATE:
-      return "DATE";
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_TIME2:
-      return "TIME";
-    case MYSQL_TYPE_DATETIME:
-    case MYSQL_TYPE_DATETIME2:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_TIMESTAMP2:
-      return "TIMESTAMP";
-    case MYSQL_TYPE_YEAR:
-      return "SMALLINT";
-    case MYSQL_TYPE_BIT:
-      return "BOOLEAN";
-    default:
-      return "";
-  }
-}
-
-std::string build_empty_view_query(TABLE_LIST *tbl)
-{
-  std::string query = "CREATE OR REPLACE TEMP VIEW " +
-                      quote_identifier(tbl->table_name.str) + " AS SELECT ";
-  bool first = true;
-
-  for (Field **field = tbl->table->field; *field; ++field) {
-    Field *f = *field;
-    const std::string duck_type = mariadb_type_to_duckdb(f);
-    if (duck_type.empty())
-      return "";
-
-    if (!first)
-      query += ", ";
-    first = false;
-    query += "CAST(NULL AS " + duck_type + ") AS " +
-             quote_identifier(f->field_name.str);
-  }
-
-  query += " WHERE FALSE";
-  return query;
-}
-
-std::string build_read_view_query(TABLE_LIST *tbl,
-                                  const std::vector<std::string> &s3_files)
-{
-  std::string parquet_file_list = "[";
-  for (size_t i = 0; i < s3_files.size(); ++i) {
-    if (i != 0)
-      parquet_file_list += ", ";
-    parquet_file_list += quote_string_literal(s3_files[i]);
-  }
-  parquet_file_list += "]";
-
-  return "CREATE OR REPLACE TEMP VIEW " + quote_identifier(tbl->table_name.str) +
-         " AS SELECT * FROM read_parquet(" + parquet_file_list + ")";
-}
-
-void store_field_temporal_value(Field *field, MYSQL_TIME *ltime)
-{
-  field->store_time(ltime);
-}
-
-void store_duckdb_field_in_mysql_format(Field *field, duckdb::Value &value,
-                                        THD *thd)
-{
-  (void) thd;
-  if (value.IsNull()) {
-    field->set_default();
-    if (field->real_maybe_null())
-      field->set_null();
-    return;
-  }
-
-  field->set_notnull();
-  switch (field->type()) {
-    case MYSQL_TYPE_TINY_BLOB:
-    case MYSQL_TYPE_MEDIUM_BLOB:
-    case MYSQL_TYPE_LONG_BLOB:
-    case MYSQL_TYPE_BLOB:
-    case MYSQL_TYPE_GEOMETRY:
-    case MYSQL_TYPE_BIT: {
-      auto str = value.GetValueUnsafe<duckdb::string>();
-      field->store(str.c_str(), str.size(), &my_charset_bin);
-      break;
-    }
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_STRING:
-    case MYSQL_TYPE_VAR_STRING: {
-      auto str = value.GetValue<duckdb::string>();
-      field->store(str.c_str(), str.size(),
-                   field->has_charset() ? field->charset() : &my_charset_bin);
-      break;
-    }
-    case MYSQL_TYPE_NULL:
-    case MYSQL_TYPE_DECIMAL:
-    case MYSQL_TYPE_ENUM:
-    case MYSQL_TYPE_SET:
-    case MYSQL_TYPE_NEWDECIMAL: {
-      auto str = value.GetValue<duckdb::string>();
-      field->store(str.c_str(), str.size(), system_charset_info);
-      break;
-    }
-    case MYSQL_TYPE_TINY:
-    case MYSQL_TYPE_YEAR:
-    case MYSQL_TYPE_SHORT:
-    case MYSQL_TYPE_INT24:
-    case MYSQL_TYPE_LONG: {
-      int64_t v = value.GetValue<int64_t>();
-      field->store(v, field->is_unsigned());
-      break;
-    }
-    case MYSQL_TYPE_LONGLONG: {
-      if (field->is_unsigned())
-        field->store(value.GetValue<uint64_t>(), true);
-      else
-        field->store(value.GetValue<int64_t>(), false);
-      break;
-    }
-    case MYSQL_TYPE_FLOAT:
-      field->store(value.GetValue<float>());
-      break;
-    case MYSQL_TYPE_DOUBLE:
-      field->store(value.GetValue<double>());
-      break;
-    case MYSQL_TYPE_DATE:
-    case MYSQL_TYPE_NEWDATE:
-    case MYSQL_TYPE_DATETIME:
-    case MYSQL_TYPE_DATETIME2:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_TIMESTAMP2: {
-      auto str = value.GetValue<duckdb::string>();
-      MYSQL_TIME tm;
-      MYSQL_TIME_STATUS status;
-      my_time_status_init(&status);
-      str_to_datetime_or_date(str.c_str(), str.size(), &tm, 0, &status);
-      store_field_temporal_value(field, &tm);
-      break;
-    }
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_TIME2: {
-      auto str = value.GetValue<duckdb::string>();
-      MYSQL_TIME tm;
-      MYSQL_TIME_STATUS status;
-      my_time_status_init(&status);
-      str_to_DDhhmmssff(str.c_str(), str.size(), &tm, TIME_MAX_HOUR, &status);
-      store_field_temporal_value(field, &tm);
-      break;
-    }
-    default: {
-      auto str = value.GetValue<duckdb::string>();
-      field->store(str.c_str(), str.size(), system_charset_info);
-      break;
-    }
-  }
-}
 
 std::string describe_tables(const std::vector<TABLE_LIST *> &tables)
 {
@@ -312,6 +112,7 @@ ha_parquet_select_handler::ha_parquet_select_handler(THD *thd_arg,
                                                      SELECT_LEX *sel_lex,
                                                      SELECT_LEX_UNIT *sel_unit)
     : select_handler(thd_arg, parquet_hton, sel_lex, sel_unit),
+      duckdb_con(nullptr),
       current_row_index(0),
       has_cross_engine(false),
       query_string(thd_arg->charset())
@@ -337,27 +138,45 @@ int ha_parquet_select_handler::init_scan()
 {
   DBUG_ENTER("ha_parquet_select_handler::init_scan");
 
-  duckdb_db = std::make_unique<duckdb::DuckDB>(nullptr);
-  myparquet::register_cross_engine_scan(*duckdb_db->instance);
-  duckdb_con = std::make_unique<duckdb::Connection>(*duckdb_db);
-  parquet_log_info("DuckDB select handler initialized");
+  {
+    std::lock_guard<std::mutex> lock(parquet::parquet_duckdb_mutex());
+    std::string error_message;
+    duckdb_con = parquet::parquet_pushdown_connection_locked(&error_message);
+    if (duckdb_con == nullptr) {
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
+  }
+  parquet_log_info("DuckDB select handler initialized using shared runtime");
   query_result.reset();
   current_chunk.reset();
   current_row_index = 0;
+  temp_view_names.clear();
 
   auto cleanup_external_registry = [&]() {
     if (has_cross_engine)
       myparquet::clear_external_tables();
   };
 
-  parquet_log_info("DuckDB query [select/install-parquet] INSTALL parquet;");
-  duckdb_con->Query("INSTALL parquet;");
-  parquet_log_info("DuckDB query [select/load-parquet] LOAD parquet;");
-  duckdb_con->Query("LOAD parquet;");
-  parquet_log_info("DuckDB query [select/install-httpfs] INSTALL httpfs;");
-  duckdb_con->Query("INSTALL httpfs;");
-  parquet_log_info("DuckDB query [select/load-httpfs] LOAD httpfs;");
-  duckdb_con->Query("LOAD httpfs;");
+  auto cleanup_temp_views = [&]() {
+    if (duckdb_con == nullptr || temp_view_names.empty())
+      return;
+
+    for (const auto &view_name : temp_view_names) {
+      const std::string drop_view_sql =
+          "DROP VIEW IF EXISTS " + parquet::QuoteIdentifier(view_name);
+      parquet_log_info("DuckDB query [select/drop-temp-view] " +
+                       parquet_log_preview(drop_view_sql));
+      auto drop_result = duckdb_con->Query(drop_view_sql);
+      if (!drop_result || drop_result->HasError()) {
+        sql_print_warning(
+            "Parquet: failed to drop cached temp view '%s': %s",
+            view_name.c_str(),
+            drop_result ? drop_result->GetError().c_str() : "null result");
+      }
+    }
+    temp_view_names.clear();
+  };
 
   parquet::ObjectStoreConfig scan_object_store_config;
   bool have_scan_object_store_config = false;
@@ -369,8 +188,9 @@ int ha_parquet_select_handler::init_scan()
             tbl->table->s->normalized_path.str, &metadata, &error_message) ||
         !parquet::ValidateCatalogConfig(metadata, &error_message) ||
         !parquet::ValidateObjectStoreConfig(metadata, true, &error_message)) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
@@ -379,41 +199,49 @@ int ha_parquet_select_handler::init_scan()
       have_scan_object_store_config = true;
     } else if (!duckdb_configs_compatible(scan_object_store_config,
                                           metadata.object_store_config)) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0),
                "Parquet pushdown currently requires matching object-store "
                "credentials and endpoint settings across Parquet tables");
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
-    if (!configure_duckdb_s3(duckdb_con.get(), metadata.object_store_config,
+    if (!configure_duckdb_s3(duckdb_con, metadata.object_store_config,
                              &error_message)) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
-    std::vector<std::string> s3_files;
-    long http_code = 0;
-    if (!resolve_parquet_data_files(metadata, &s3_files, &http_code)) {
+    std::vector<std::string> scan_paths;
+    if (!resolve_parquet_scan_paths(&metadata, &scan_paths, &error_message)) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
-               "Failed to fetch LakeKeeper metadata for Parquet pushdown");
-      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
-    }
-    if (http_code != 200) {
-      cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
-               "LakeKeeper returned a non-200 response for Parquet pushdown");
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
-    const std::string create_view_sql = s3_files.empty()
-        ? build_empty_view_query(tbl)
-        : build_read_view_query(tbl, s3_files);
+    std::string create_view_sql;
+    if (scan_paths.empty()) {
+      if (!parquet::BuildDuckDBEmptyViewSql(
+              tbl->table_name.str, tbl->table, &create_view_sql,
+              &error_message)) {
+        cleanup_temp_views();
+        cleanup_external_registry();
+        my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+      }
+    } else {
+      create_view_sql =
+          parquet::BuildDuckDBReadParquetViewSql(tbl->table_name.str,
+                                                 scan_paths);
+    }
     if (create_view_sql.empty()) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0),
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0),
                "Parquet pushdown could not map the table schema to DuckDB");
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
@@ -422,21 +250,24 @@ int ha_parquet_select_handler::init_scan()
                      parquet_log_preview(create_view_sql));
     auto create_view_result = duckdb_con->Query(create_view_sql);
     if (!create_view_result || create_view_result->HasError()) {
+      cleanup_temp_views();
       cleanup_external_registry();
       const std::string error_message =
           create_view_result ? create_view_result->GetError()
                              : "DuckDB returned a null result while creating a Parquet view";
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
+    temp_view_names.push_back(tbl->table_name.str);
   }
 
   if (have_scan_object_store_config) {
     std::string error_message;
-    if (!configure_duckdb_s3(duckdb_con.get(), scan_object_store_config,
+    if (!configure_duckdb_s3(duckdb_con, scan_object_store_config,
                              &error_message)) {
+      cleanup_temp_views();
       cleanup_external_registry();
-      my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
   }
@@ -458,11 +289,12 @@ int ha_parquet_select_handler::init_scan()
   query_result = duckdb_con->Query(sql);
 
   if (!query_result || query_result->HasError()) {
+    cleanup_temp_views();
     cleanup_external_registry();
     const std::string error_message =
         query_result ? query_result->GetError()
                      : "DuckDB returned a null result for Parquet pushdown";
-    my_error(ER_UNKNOWN_ERROR, MYF(0), error_message.c_str());
+    my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
@@ -495,7 +327,12 @@ int ha_parquet_select_handler::next_row()
   for (size_t col_idx = 0; col_idx < ncols; ++col_idx) {
     duckdb::Value value = current_chunk->GetValue(col_idx, current_row_index);
     Field *field = table->field[col_idx];
-    store_duckdb_field_in_mysql_format(field, value, thd);
+    std::string error_message;
+    if (!parquet::StoreDuckDBValueInMariaDBField(field, value, thd,
+                                                 &error_message)) {
+      my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
   }
 
   current_row_index++;
@@ -511,8 +348,23 @@ int ha_parquet_select_handler::end_scan()
 
   current_chunk.reset();
   query_result.reset();
-  duckdb_con.reset();
-  duckdb_db.reset();
+  if (duckdb_con != nullptr && !temp_view_names.empty()) {
+    for (const auto &view_name : temp_view_names) {
+      const std::string drop_view_sql =
+          "DROP VIEW IF EXISTS " + parquet::QuoteIdentifier(view_name);
+      parquet_log_info("DuckDB query [select/drop-temp-view] " +
+                       parquet_log_preview(drop_view_sql));
+      auto drop_result = duckdb_con->Query(drop_view_sql);
+      if (!drop_result || drop_result->HasError()) {
+        sql_print_warning(
+            "Parquet: failed to drop cached temp view '%s': %s",
+            view_name.c_str(),
+            drop_result ? drop_result->GetError().c_str() : "null result");
+      }
+    }
+  }
+  temp_view_names.clear();
+  duckdb_con = nullptr;
   parquet_log_info("DuckDB select handler deinitialized");
   current_row_index = 0;
   has_cross_engine = false;
@@ -524,6 +376,72 @@ int ha_parquet_select_handler::end_scan()
   }
 
   DBUG_RETURN(0);
+}
+
+bool is_duckdb_pushdown_supported(THD *thd, SELECT_LEX *sel_lex,
+                                  const std::vector<TABLE_LIST *> &parquet_tables,
+                                  const std::vector<TABLE_LIST *> &external_tables)
+{
+  if (!thd || !thd->query())
+    return false;
+    
+  std::string sql(thd->query(), thd->query_length());
+
+  // Strip a leading EXPLAIN keyword so we don't double-wrap when MariaDB
+  // calls create_select during its own EXPLAIN processing.
+  {
+    size_t pos = 0;
+    while (pos < sql.size() && std::isspace((unsigned char)sql[pos]))
+      ++pos;
+    if (pos + 7 <= sql.size()) {
+      std::string prefix = sql.substr(pos, 7);
+      std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::toupper);
+      if (prefix == "EXPLAIN") {
+        pos += 7;
+        while (pos < sql.size() && std::isspace((unsigned char)sql[pos]))
+          ++pos;
+        sql = sql.substr(pos);
+      }
+    }
+  }
+  
+  std::lock_guard<std::mutex> lock(parquet::parquet_duckdb_mutex());
+  std::string error;
+  duckdb::Connection *con = parquet::parquet_pushdown_connection_locked(&error);
+  if (!con) return false;
+
+  std::vector<std::string> temp_views;
+  
+  for (auto *tbl : parquet_tables) {
+    if (!tbl || !tbl->table) continue;
+    std::string create_sql;
+    if (parquet::BuildDuckDBEmptyViewSql(tbl->table_name.str, tbl->table, &create_sql, &error)) {
+      if (!con->Query(create_sql)->HasError()) {
+        temp_views.push_back(tbl->table_name.str);
+      }
+    }
+  }
+
+  bool has_cross_engine = !external_tables.empty();
+  if (has_cross_engine) {
+    for (TABLE_LIST *tbl : external_tables)
+      register_external_table_names(tbl);
+  }
+
+  // Passively check for failure within DuckDB by running EXPLAIN.
+  // This verifies syntax, column binding, and function translation.
+  auto result = con->Query("EXPLAIN " + sql);
+  bool success = result && !result->HasError();
+
+  if (has_cross_engine) {
+    myparquet::clear_external_tables();
+  }
+
+  for (const auto &view_name : temp_views) {
+    con->Query("DROP VIEW IF EXISTS " + parquet::QuoteIdentifier(view_name));
+  }
+
+  return success;
 }
 
 select_handler *create_duckdb_select_handler(THD *thd,
@@ -548,6 +466,9 @@ select_handler *create_duckdb_select_handler(THD *thd,
   std::vector<TABLE_LIST *> parquet_tables;
   std::vector<TABLE_LIST *> external_tables;
   if (!can_pushdown_to_parquet(sel_lex, parquet_tables, external_tables))
+    return nullptr;
+
+  if (!is_duckdb_pushdown_supported(thd, sel_lex, parquet_tables, external_tables))
     return nullptr;
 
   auto *handler = new ha_parquet_select_handler(thd, sel_lex, sel_unit);

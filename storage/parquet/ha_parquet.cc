@@ -1,38 +1,41 @@
 #include "ha_parquet.h"
 #include "ha_parquet_pushdown.h"
+
+#include "parquet_catalog.h"
+#include "parquet_create.h"
+#include "parquet_duckdb.h"
+#include "parquet_iceberg.h"
 #include "parquet_metadata.h"
 #include "parquet_object_store.h"
+#include "parquet_schema.h"
 #include "parquet_shared.h"
 #include "parquet_transaction.h"
-#include "duckdb.hpp"
+
 #include "handler.h"
 #include "my_sys.h"
 #include "sql_class.h"
 
 #include <json.hpp>
-#include <curl/curl.h>
+
 #include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <ctime>
 #include <mutex>
 
-
-static std::mutex g_duckdb_mutex;
 handlerton *parquet_hton = 0;
+
+namespace {
+
+using json = nlohmann::json;
+
 static THR_LOCK parquet_lock;
-static duckdb::DuckDB *g_duckdb = nullptr;
-static int ha_parquet_commit(THD *thd, bool all);
 
 struct ha_table_option_struct
 {
   char *catalog;
   char *connection;
 };
-
-namespace {
-
-using json = nlohmann::json;
 
 static ha_create_table_option parquet_table_option_list[] = {
     HA_TOPTION_STRING("CATALOG", catalog),
@@ -84,20 +87,23 @@ static void update_s3_secret_access_key(MYSQL_THD, struct st_mysql_sys_var *,
 
 static MYSQL_SYSVAR_STR(lakekeeper_base_url, parquet_lakekeeper_base_url,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-                        "LakeKeeper catalog base URL", 0, 0,
+                        "Iceberg REST catalog base URL", 0, 0,
                         "http://localhost:8181/catalog/v1/");
 static MYSQL_SYSVAR_STR(lakekeeper_warehouse_id,
                         parquet_lakekeeper_warehouse_id,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-                        "LakeKeeper warehouse ID", 0, 0, "");
+                        "Iceberg REST catalog warehouse name or LakeKeeper "
+                        "warehouse ID",
+                        0, 0, "");
 static MYSQL_SYSVAR_STR(lakekeeper_namespace, parquet_lakekeeper_namespace,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-                        "LakeKeeper default namespace", 0, 0, "default");
+                        "Default Iceberg REST catalog namespace", 0, 0,
+                        "default");
 static MYSQL_SYSVAR_STR(lakekeeper_bearer_token,
                         parquet_tmp_lakekeeper_bearer_token,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY |
                             PLUGIN_VAR_MEMALLOC,
-                        "LakeKeeper bearer token", 0,
+                        "Iceberg REST catalog bearer token", 0,
                         update_lakekeeper_bearer_token, "");
 static MYSQL_SYSVAR_STR(s3_bucket, parquet_s3_bucket,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
@@ -154,6 +160,32 @@ bool raise_create_option_error(const std::string &message)
   return false;
 }
 
+std::string catalog_status_message(const std::string &operation,
+                                   const parquet::CatalogStatus &status)
+{
+  std::string message = operation;
+  if (!status.message.empty()) {
+    message += ": " + status.message;
+  }
+  if (status.http_status != 0) {
+    message += " (HTTP " + std::to_string(status.http_status) + ")";
+  }
+  return message;
+}
+
+std::string object_status_message(const std::string &operation,
+                                  const parquet::ObjectStoreStatus &status)
+{
+  std::string message = operation;
+  if (!status.message.empty()) {
+    message += ": " + status.message;
+  }
+  if (status.http_status != 0) {
+    message += " (HTTP " + std::to_string(status.http_status) + ")";
+  }
+  return message;
+}
+
 bool resolve_runtime_metadata_or_error(const char *table_path,
                                        parquet::TableMetadata *metadata)
 {
@@ -185,6 +217,19 @@ bool validate_object_store_or_error(const parquet::TableMetadata &metadata)
   return true;
 }
 
+bool bootstrap_catalog_or_error(parquet::ParquetCatalogClient *client,
+                                std::string *error)
+{
+  auto status = client->BootstrapConfig();
+  if (!status.ok()) {
+    if (error != nullptr) {
+      *error = catalog_status_message(
+          "failed to bootstrap Iceberg REST catalog", status);
+    }
+    return false;
+  }
+  return true;
+}
 
 json namespace_json_array(const parquet::CatalogNamespaceIdent &ident)
 {
@@ -223,194 +268,213 @@ int ha_parquet::close(void) { return 0; }
 
 static std::string item_to_sql(const Item *item)
 {
- if (!item) return "";
- const Item_func *func = dynamic_cast<const Item_func *>(item);
- if (!func || func->argument_count() != 2) return "";
+  if (!item) return "";
+  const Item_func *func = dynamic_cast<const Item_func *>(item);
+  if (!func || func->argument_count() != 2) return "";
 
+  const Item *left = func->arguments()[0];
+  const Item *right = func->arguments()[1];
 
- const Item *left = func->arguments()[0];
- const Item *right = func->arguments()[1];
+  if (left->type() != Item::FIELD_ITEM) return "";
 
+  const Item_field *field = static_cast<const Item_field *>(left);
+  std::string col = parquet::QuoteIdentifier(field->field_name.str);
+  std::string val;
 
- if (left->type() != Item::FIELD_ITEM) return "";
+  if (right->type() == Item::CONST_ITEM) {
+    String tmp;
+    String *s = const_cast<Item*>(right)->val_str(&tmp);
+    if (!s) return "";
+    std::string strval(s->ptr(), s->length());
+    bool is_number = !strval.empty() &&
+                     (isdigit((unsigned char)strval[0]) || strval[0] == '-');
+    val = is_number ? strval : quote_string_literal(strval);
+  } else {
+    return "";
+  }
 
-
- const Item_field *field = static_cast<const Item_field *>(left);
- std::string col = field->field_name.str;
- std::string val;
-
-
- if (right->type() == Item::CONST_ITEM) {
-   String tmp;
-   String *s = const_cast<Item*>(right)->val_str(&tmp);
-   if (!s) return "";
-   std::string strval(s->ptr(), s->length());
-   bool is_number = !strval.empty() &&
-                    (isdigit((unsigned char)strval[0]) || strval[0] == '-');
-   val = is_number ? strval : quote_string_literal(strval);
- } else {
-   return "";
- }
-
-
- std::string op = func->func_name();
- if (op == "=" || op == "eq") return col + " = " + val;
- if (op == ">" || op == "gt") return col + " > " + val;
- if (op == "<" || op == "lt") return col + " < " + val;
- return "";
+  std::string op = func->func_name();
+  if (op == "=" || op == "eq") return col + " = " + val;
+  if (op == ">" || op == "gt") return col + " > " + val;
+  if (op == "<" || op == "lt") return col + " < " + val;
+  return "";
 }
 
-
-const Item *ha_parquet::cond_push(const Item *cond)
-{
- DBUG_ENTER("ha_parquet::cond_push");
- pushed_cond_sql.clear();
- has_pushed_cond = false;
- if (cond) {
-   pushed_cond_sql = item_to_sql(cond);
-   if (!pushed_cond_sql.empty()) {
-    has_pushed_cond = true;
-    DBUG_RETURN(nullptr);
-   }
-   
- }
- DBUG_RETURN(cond);
-}
-
-
-void ha_parquet::cond_pop()
-{
- pushed_cond_sql.clear();
- has_pushed_cond = false;
-}
-
-
-static std::string mariadb_type_to_duckdb(Field *f)
-{
- switch (f->type()) {
-   case MYSQL_TYPE_TINY:     return "TINYINT";
-   case MYSQL_TYPE_SHORT:    return "SMALLINT";
-   case MYSQL_TYPE_INT24:
-   case MYSQL_TYPE_LONG:     return "INTEGER";
-   case MYSQL_TYPE_LONGLONG: return "BIGINT";
-   case MYSQL_TYPE_FLOAT:    return "FLOAT";
-   case MYSQL_TYPE_DOUBLE:   return "DOUBLE";
-   case MYSQL_TYPE_DECIMAL:
-   case MYSQL_TYPE_NEWDECIMAL: return "DECIMAL";
-   case MYSQL_TYPE_VARCHAR:
-   case MYSQL_TYPE_VAR_STRING:
-   case MYSQL_TYPE_STRING:
-   case MYSQL_TYPE_ENUM:
-   case MYSQL_TYPE_SET:      return "VARCHAR";
-   case MYSQL_TYPE_TINY_BLOB:
-   case MYSQL_TYPE_MEDIUM_BLOB:
-   case MYSQL_TYPE_LONG_BLOB:
-   case MYSQL_TYPE_BLOB:
-     return (f->charset() == &my_charset_bin) ? "BLOB" : "VARCHAR";
-   case MYSQL_TYPE_DATE:
-   case MYSQL_TYPE_NEWDATE:  return "DATE";
-   case MYSQL_TYPE_TIME:
-   case MYSQL_TYPE_TIME2:    return "TIME";
-   case MYSQL_TYPE_DATETIME:
-   case MYSQL_TYPE_DATETIME2:
-   case MYSQL_TYPE_TIMESTAMP:
-   case MYSQL_TYPE_TIMESTAMP2: return "TIMESTAMP";
-   case MYSQL_TYPE_YEAR:     return "SMALLINT";
-   case MYSQL_TYPE_BIT:      return "BOOLEAN";
-   default:                  return "";
- }
-}
-
-
-static std::string build_query_create(const std::string &table_name, TABLE *table_arg)
-{
- std::string query = "CREATE TABLE IF NOT EXISTS " + table_name + " (";
- bool first = true;
- for (Field **field = table_arg->s->field; *field; ++field) {
-   Field *f = *field;
-   std::string duck_type = mariadb_type_to_duckdb(f);
-   if (duck_type.empty()) return "";
-   if (!first) query += ", ";
-   first = false;
-   query += std::string(f->field_name.str) + " " + duck_type;
- }
- query += ")";
- return query;
-}
-
-
-static std::string build_copy_to_parquet_query(const std::string &table_name,
-                                              const std::string &parquet_file)
-{
- return "COPY " + table_name + " TO " +
-        quote_string_literal(parquet_file) + " (FORMAT PARQUET)";
-}
-
-static bool needs_quoting(Field *f)
-{
- switch (f->type()) {
-   case MYSQL_TYPE_VARCHAR: case MYSQL_TYPE_VAR_STRING: case MYSQL_TYPE_STRING:
-   case MYSQL_TYPE_ENUM: case MYSQL_TYPE_SET:
-   case MYSQL_TYPE_TINY_BLOB: case MYSQL_TYPE_MEDIUM_BLOB:
-   case MYSQL_TYPE_LONG_BLOB: case MYSQL_TYPE_BLOB:
-   case MYSQL_TYPE_DATE: case MYSQL_TYPE_NEWDATE:
-   case MYSQL_TYPE_TIME: case MYSQL_TYPE_TIME2:
-   case MYSQL_TYPE_DATETIME: case MYSQL_TYPE_DATETIME2:
-   case MYSQL_TYPE_TIMESTAMP: case MYSQL_TYPE_TIMESTAMP2:
-     return true;
-   default: return false;
- }
-}
-
-static bool parquet_is_real_commit(THD *thd, bool all)
+bool is_real_commit(THD *thd, bool all)
 {
   return ((all || thd->transaction->all.ha_list == 0) &&
           !(thd->variables.option_bits & OPTION_GTID_BEGIN));
 }
 
-static bool parquet_is_real_rollback(THD *thd, bool all)
+bool is_real_rollback(THD *thd, bool all)
 {
   return all || thd->transaction->all.ha_list == 0;
 }
 
-static uint64_t parquet_table_hash(const std::string &table_path)
+bool has_pending_work(const parquet::ParquetTxnState &txn_state,
+                      int *pending_table_count)
 {
-  return static_cast<uint64_t>(std::hash<std::string>{}(table_path));
+  bool pending = false;
+  int count = 0;
+  for (const auto &entry : txn_state.tables) {
+    const auto &table_state = entry.second;
+    if (!table_state.local_stage_files.empty() ||
+        !table_state.staged_files.empty() ||
+        table_state.statement_row_count != 0) {
+      pending = true;
+      count++;
+    }
+  }
+  if (pending_table_count != nullptr) {
+    *pending_table_count = count;
+  }
+  return pending;
 }
 
-static std::string parquet_statement_buffer_name(THD *thd,
-                                                 const std::string &table_path)
+bool catalog_configs_compatible(const parquet::CatalogClientConfig &left,
+                                const parquet::CatalogClientConfig &right)
 {
-  return "buf_stmt_" + std::to_string(static_cast<unsigned long long>(
-                           thd->thread_id)) +
-         "_" +
-         std::to_string(static_cast<unsigned long long>(thd->query_id)) +
-         "_" + std::to_string(static_cast<unsigned long long>(
-                   parquet_table_hash(table_path)));
+  return left.base_uri == right.base_uri &&
+         left.warehouse == right.warehouse &&
+         left.prefix == right.prefix &&
+         left.bearer_token == right.bearer_token;
 }
 
-static parquet_table_trx_data *parquet_table_txn_for_share(
-    parquet_trx_data *trx, THD *thd, TABLE_SHARE *share)
+bool upload_file(parquet::ParquetTableTxnState *table_state,
+                 parquet::ParquetObjectStoreClient *object_store,
+                 const std::string &local_path,
+                 const parquet::ObjectLocation &location,
+                 const std::string &content_type,
+                 uint64_t expected_length,
+                 std::string *error)
 {
-  if (trx == nullptr || thd == nullptr || share == nullptr) {
-    return nullptr;
+  parquet::PutObjectRequest request;
+  request.local_file_path = local_path;
+  request.location = location;
+  request.content_type = content_type;
+  request.expected_content_length = expected_length;
+
+  auto status = object_store->PutFile(request);
+  if (!status.ok()) {
+    if (error != nullptr) {
+      *error = object_status_message("failed to upload Parquet object", status);
+    }
+    return false;
   }
 
-  const std::string table_path = share->normalized_path.str;
-  auto &table_trx = trx->tables[table_path];
-  if (table_trx.table_path.empty()) {
-    table_trx.table_path = table_path;
-    table_trx.table_name = share->table_name.str;
-  }
-  return &table_trx;
+  table_state->uploaded_objects.push_back(location);
+  return true;
 }
 
-static bool parquet_drop_duckdb_table(const std::string &table_name)
+void cleanup_uploaded_objects(parquet::ParquetTableTxnState *table_state,
+                              const parquet::TableMetadata &metadata)
 {
-  if (table_name.empty()) {
+  if (table_state == nullptr || table_state->uploaded_objects.empty()) {
+    return;
+  }
+
+  parquet::ParquetObjectStoreClient object_store(metadata.object_store_config);
+  auto results = object_store.DeleteObjectsBestEffort(table_state->uploaded_objects);
+  for (const auto &result : results) {
+    if (!result.status.ok()) {
+      std::cerr << "Parquet cleanup failed for "
+                << parquet::BuildS3Uri(result.location.bucket,
+                                       result.location.key)
+                << ": " << result.status.message << std::endl;
+    }
+  }
+  table_state->uploaded_objects.clear();
+}
+
+struct CommitWork {
+  parquet::ParquetTableTxnState *table_state = nullptr;
+  parquet::TableMetadata metadata;
+  parquet::CatalogLoadTableResult load_result;
+  parquet::IcebergCommitArtifacts artifacts;
+  std::unique_ptr<parquet::ParquetCatalogClient> catalog_client;
+};
+
+bool prepare_commit_metadata(parquet::ParquetTableTxnState *table_state,
+                             CommitWork *work,
+                             std::string *error)
+{
+  if (table_state == nullptr || work == nullptr) {
+    if (error != nullptr) {
+      *error = "invalid transaction state while preparing Parquet commit";
+    }
+    return false;
+  }
+
+  work->table_state = table_state;
+  if (!parquet::ResolveRuntimeTableMetadata(table_state->table_path.c_str(),
+                                            &work->metadata, error) ||
+      !parquet::ValidateCatalogConfig(work->metadata, error) ||
+      !parquet::ValidateObjectStoreConfig(work->metadata, true, error)) {
+    return false;
+  }
+
+  work->catalog_client.reset(
+      new parquet::ParquetCatalogClient(work->metadata.catalog_config));
+  return bootstrap_catalog_or_error(work->catalog_client.get(), error);
+}
+
+bool materialize_upload_and_build_artifacts(CommitWork *work,
+                                            std::string *error)
+{
+  auto *table_state = work->table_state;
+  const bool has_pending_files =
+      !table_state->local_stage_files.empty() ||
+      !table_state->staged_files.empty();
+  if (has_pending_files) {
+    auto load_status = work->catalog_client->LoadTable(
+        work->metadata.catalog_table_ident, &work->load_result,
+        work->metadata.access_delegation);
+    if (!load_status.ok()) {
+      if (error != nullptr) {
+        *error = catalog_status_message(
+            "failed to load Iceberg table before commit", load_status);
+      }
+      return false;
+    }
+
+    if (!parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result,
+                                         error)) {
+      return false;
+    }
+  }
+
+  parquet::ParquetStagedFile staged_file;
+  if (!parquet::MaterializeLocalDataFile(table_state, work->metadata,
+                                         &staged_file, error)) {
+    return false;
+  }
+  if (table_state->staged_files.empty()) {
     return true;
   }
 
+  parquet::ParquetObjectStoreClient object_store(
+      work->metadata.object_store_config);
+  for (const auto &file : table_state->staged_files) {
+    parquet::ObjectLocation location;
+    if (!parquet::ParseS3Uri(file.target_object_path, &location)) {
+      if (error != nullptr) {
+        *error = "failed to parse staged object path " + file.target_object_path;
+      }
+      return false;
+    }
+    location = parquet::ResolveAbsoluteObjectLocation(
+        work->metadata.object_store_config, location.bucket, location.key);
+    if (!upload_file(table_state, &object_store, file.local_parquet_path,
+                     location, "application/vnd.apache.parquet",
+                     file.file_size_bytes, error)) {
+      return false;
+    }
+  }
+
+  if (!parquet::BuildIcebergCommitArtifacts(work->metadata, work->load_result,
+                                            table_state->staged_files,
+                                            &work->artifacts, error)) {
+    return false;
   try {
     std::lock_guard<std::mutex> lock(g_duckdb_mutex);
     auto con = std::make_unique<duckdb::Connection>(*g_duckdb);
@@ -442,15 +506,35 @@ static void parquet_reset_statement_buffer(parquet_table_trx_data *table_trx)
                      table_trx->statement_buffer_name + "'");
     parquet_drop_duckdb_table(table_trx->statement_buffer_name);
   }
-  table_trx->statement_buffer_name.clear();
-  table_trx->statement_row_count = 0;
+
+  table_state->local_cleanup_paths.push_back(work->artifacts.manifest_local_path);
+  table_state->local_cleanup_paths.push_back(
+      work->artifacts.manifest_list_local_path);
+
+  if (!upload_file(table_state, &object_store,
+                   work->artifacts.manifest_local_path,
+                   work->artifacts.manifest_location,
+                   "application/octet-stream", 0, error)) {
+    return false;
+  }
+  return upload_file(table_state, &object_store,
+                     work->artifacts.manifest_list_local_path,
+                     work->artifacts.manifest_list_location,
+                     "application/octet-stream", 0, error);
 }
 
-static void parquet_remove_local_stage_files(parquet_table_trx_data *table_trx)
+bool save_committed_metadata(CommitWork *work, std::string *error)
 {
-  if (table_trx == nullptr) {
-    return;
+  if (!parquet::ApplyCatalogLoadResult(&work->metadata, work->load_result,
+                                       error)) {
+    return false;
   }
+  work->metadata.current_snapshot_id =
+      std::to_string(work->artifacts.snapshot_id);
+  work->metadata.active_files = work->artifacts.active_files;
+  work->metadata.active_scan_paths =
+      parquet::ExtractActiveScanPaths(work->metadata.active_files);
+  return parquet::SaveTableMetadata(work->metadata, error);
 
   for (const auto &staged_file : table_trx->staged_files) {
     if (!staged_file.local_path.empty()) {
@@ -470,8 +554,17 @@ static uint64_t parquet_next_local_stage_id()
          (local_stage_counter.fetch_add(1) % 1000ULL);
 }
 
-static uint64_t parquet_next_remote_stage_id()
+json table_change_json(const CommitWork &work)
 {
+  json change = json::parse(work.artifacts.commit_request_json);
+  change["identifier"] = {
+      {"namespace", namespace_json_array(
+                        work.metadata.catalog_table_ident.namespace_ident)},
+      {"name", work.metadata.catalog_table_ident.table_name}};
+  return change;
+}
+
+bool commit_prepared_work(std::vector<CommitWork> *works, std::string *error)
   static std::atomic<uint64_t> remote_stage_counter{0};
   return static_cast<uint64_t>(time(nullptr)) * 1000ULL +
          (remote_stage_counter.fetch_add(1) % 1000ULL);
@@ -481,11 +574,22 @@ static bool parquet_stage_statement_buffer_to_local(
     parquet_table_trx_data *table_trx, const std::string &canonical_parquet_path,
     std::string *error)
 {
-  if (table_trx == nullptr || table_trx->statement_row_count == 0 ||
-      table_trx->statement_buffer_name.empty()) {
+  if (works == nullptr || works->empty()) {
     return true;
   }
 
+  if (works->size() == 1) {
+    CommitWork &work = works->front();
+    parquet::CatalogCommitRequest request;
+    request.ident = work.metadata.catalog_table_ident;
+    request.request_json = work.artifacts.commit_request_json;
+
+    parquet::CatalogLoadTableResult commit_result;
+    auto status = work.catalog_client->CommitTable(request, &commit_result);
+    if (!status.ok()) {
+      if (!status.commit_state_unknown) {
+        cleanup_uploaded_objects(work.table_state, work.metadata);
+      }
   const auto stage_id = parquet_next_local_stage_id();
   const std::string local_stage_path =
       parquet::BuildLocalStagePath(canonical_parquet_path, stage_id);
@@ -501,59 +605,90 @@ static bool parquet_stage_statement_buffer_to_local(
     auto copy_result = con->Query(copy_query);
     if (!copy_result || copy_result->HasError()) {
       if (error != nullptr) {
-        *error = copy_result ? copy_result->GetError()
-                             : "DuckDB returned a null result while staging";
+        *error = catalog_status_message("failed to commit Iceberg table",
+                                        status);
       }
       return false;
     }
+    if (commit_result.status.ok() &&
+        !commit_result.metadata.raw_metadata_json.empty()) {
+      work.load_result = commit_result;
   } catch (const std::exception &e) {
     if (error != nullptr) {
       *error = e.what();
     }
+    return save_committed_metadata(&work, error);
+  }
+
+  json changes = json::array();
+  for (const auto &work : *works) {
+    changes.push_back(table_change_json(work));
+  }
+
+  parquet::CatalogTransactionCommitRequest request;
+  request.request_json = json({{"table-changes", changes}}).dump();
+
+  auto status = works->front().catalog_client->CommitTransactionIfSupported(
+      request);
+  if (!status.ok()) {
+    if (!status.commit_state_unknown) {
+      for (auto &work : *works) {
+        cleanup_uploaded_objects(work.table_state, work.metadata);
+      }
+    }
+    if (error != nullptr) {
+      *error = catalog_status_message(
+          "failed to commit Iceberg REST transaction", status);
+    }
     return false;
   }
 
-  table_trx->staged_files.push_back(
-      {local_stage_path, table_trx->statement_row_count});
-  parquet_log_info("Parquet staged local file table='" + table_trx->table_name +
-                   "' path='" + local_stage_path + "' rows=" +
-                   std::to_string(table_trx->statement_row_count));
-  parquet_reset_statement_buffer(table_trx);
+  for (auto &work : *works) {
+    if (!save_committed_metadata(&work, error)) {
+      return false;
+    }
+  }
   return true;
 }
 
-static std::string parquet_local_stage_list_sql(
-    const parquet_table_trx_data &table_trx)
+} // namespace
+
+ha_parquet::ha_parquet(handlerton *hton, TABLE_SHARE *table_arg)
+    : handler(hton, table_arg)
 {
-  std::string file_list = "[";
-  for (size_t i = 0; i < table_trx.staged_files.size(); ++i) {
-    if (i != 0) {
-      file_list += ", ";
-    }
-    file_list += quote_string_literal(table_trx.staged_files[i].local_path);
-  }
-  file_list += "]";
-  return file_list;
+  thr_lock_data_init(&parquet_lock, &lock, NULL);
 }
 
-static bool parquet_flush_local_stages_to_s3(
-    parquet_table_trx_data *table_trx, const parquet::TableMetadata &metadata,
-    std::string *s3_path, int64_t *record_count, int64_t *file_size,
-    std::string *error)
-{
-  if (table_trx == nullptr || table_trx->staged_files.empty()) {
-    if (s3_path != nullptr) {
-      s3_path->clear();
-    }
-    if (record_count != nullptr) {
-      *record_count = 0;
-    }
-    if (file_size != nullptr) {
-      *file_size = 0;
-    }
-    return true;
-  }
+ulonglong ha_parquet::table_flags() const { return HA_FILE_BASED; }
+ulong ha_parquet::index_flags(uint, uint, bool) const { return 0; }
 
+int ha_parquet::open(const char *name, int, uint)
+{
+  DBUG_ENTER("ha_parquet::open");
+  duckdb_initialized = false;
+
+  auto paths = parquet::ResolveLocalPaths(name);
+  helper_db_path = paths.helper_db_path;
+  parquet_file_path = paths.parquet_file_path;
+  duckdb_initialized = true;
+  parquet_log_info("handler open table='" + std::string(name) +
+                   "' parquet_file='" + parquet_file_path +
+                   "' helper_db='" + helper_db_path + "'");
+  DBUG_RETURN(0);
+}
+
+int ha_parquet::close(void) { return 0; }
+
+const Item *ha_parquet::cond_push(const Item *cond)
+{
+  DBUG_ENTER("ha_parquet::cond_push");
+  pushed_cond_sql.clear();
+  has_pushed_cond = false;
+  if (cond) {
+    pushed_cond_sql = item_to_sql(cond);
+    if (!pushed_cond_sql.empty()) {
+      has_pushed_cond = true;
+      DBUG_RETURN(nullptr);
   int64_t total_rows = 0;
   for (const auto &staged_file : table_trx->staged_files) {
     total_rows += static_cast<int64_t>(staged_file.row_count);
@@ -603,81 +738,41 @@ static bool parquet_flush_local_stages_to_s3(
     if (error != nullptr) {
       *error = e.what();
     }
-    return false;
   }
-
-  table_trx->uploaded_s3_file_paths.push_back(target_s3_path);
-  parquet_log_info("S3 staged object path='" + target_s3_path + "' table='" +
-                   table_trx->table_name + "' rows=" +
-                   std::to_string(total_rows) + " bytes=" +
-                   std::to_string(compressed_size));
-
-  if (s3_path != nullptr) {
-    *s3_path = target_s3_path;
-  }
-  if (record_count != nullptr) {
-    *record_count = total_rows;
-  }
-  if (file_size != nullptr) {
-    *file_size = compressed_size;
-  }
-  return true;
+  DBUG_RETURN(cond);
 }
 
-
-int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info)
+void ha_parquet::cond_pop()
 {
-  parquet::TableMetadata metadata;
+  pushed_cond_sql.clear();
+  has_pushed_cond = false;
+}
+
+int ha_parquet::create(const char *name, TABLE *table_arg,
+                       HA_CREATE_INFO *create_info)
+{
   std::string error;
   const auto *options = parquet_table_options(create_info);
-  if (!parquet::ResolveCreateTableMetadata(
-          name, options != nullptr ? options->catalog : nullptr,
-          options != nullptr ? options->connection : nullptr, &metadata,
+  parquet::CreateTableResult result;
+  if (!parquet::CreateParquetTable(
+          name, table_arg, options != nullptr ? options->catalog : nullptr,
+          options != nullptr ? options->connection : nullptr, &result,
           &error)) {
-    raise_create_option_error(error);
-    return HA_ERR_UNSUPPORTED;
-  }
-  if (!parquet::ValidateCatalogConfig(metadata, &error) ||
-      !parquet::ValidateObjectStoreConfig(metadata, true, &error)) {
+    if (result.error_kind ==
+        parquet::CreateTableErrorKind::kInvalidCreateOption) {
+      raise_create_option_error(error);
+      return HA_ERR_UNSUPPORTED;
+    }
+    if (result.error_kind == parquet::CreateTableErrorKind::kUnsupported) {
+      raise_unknown_error(error);
+      return HA_ERR_UNSUPPORTED;
+    }
     raise_unknown_error(error);
-    return HA_ERR_UNSUPPORTED; //changed this so error flag is more accurate
+    return HA_ERR_INTERNAL_ERROR;
   }
 
-  std::string table_path(name);
-  std::string parquet_file = std::string(name) + ".parquet";
-  parquet_file_path = parquet_file;
-  std::string table_name = table_name_from_path(table_path);
-
-  std::string buf_name = "buf_" + table_name;
-  std::string query = build_query_create(buf_name, table_arg);
-  if (query.empty())
-    return HA_ERR_UNSUPPORTED;
-
-  try {
-    std::lock_guard<std::mutex> lock(g_duckdb_mutex);
-    auto con = std::make_unique<duckdb::Connection>(*g_duckdb);
-    parquet_log_info("DuckDB create buffer connection table='" + table_name + "'");
-
-    parquet_log_info("DuckDB query [create/buffer-table] " +
-                     parquet_log_preview(query));
-    auto create_result = con->Query(query);
-    if (!create_result || create_result->HasError()) {
-      parquet_log_warning("DuckDB CREATE error: " +
-                          (create_result ? create_result->GetError() : "null result"));
-      return HA_ERR_INTERNAL_ERROR;
-    }
-
-    const std::string copy_query =
-        build_copy_to_parquet_query(buf_name, parquet_file);
-    parquet_log_info("DuckDB query [create/seed-parquet] " +
-                     parquet_log_preview(copy_query));
-    auto copy_result = con->Query(copy_query);
-    if (!copy_result || copy_result->HasError()) {
-      parquet_log_warning("DuckDB COPY error: " +
-                          (copy_result ? copy_result->GetError() : "null result"));
-      return HA_ERR_INTERNAL_ERROR;
-    }
-
+  helper_db_path = result.metadata.local_paths.helper_db_path;
+  parquet_file_path = result.metadata.local_paths.parquet_file_path;
     parquet_log_info("DuckDB create table seed complete table='" + table_name +
                      "' parquet_file='" + parquet_file + "'");
   } catch (const std::exception &e) {
@@ -779,15 +874,30 @@ int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
 
 int ha_parquet::delete_table(const char *name)
 {
- DBUG_ENTER("ha_parquet::delete_table");
+  DBUG_ENTER("ha_parquet::delete_table");
 
- const std::string table_path(name);
- parquet::TableMetadata metadata;
- if (!resolve_runtime_metadata_or_error(name, &metadata) ||
-     !validate_catalog_or_error(metadata)) {
-   DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
- }
+  const std::string table_path(name);
+  if (!parquet::MetadataSidecarExists(name)) {
+    parquet_log_info("drop table skipped Iceberg REST catalog delete for '" +
+                     table_path +
+                     "' because Parquet sidecar metadata is absent");
+    std::remove((table_path + ".parquet").c_str());
+    std::remove((table_path + ".parquet.meta").c_str());
+    DBUG_RETURN(0);
+  }
 
+  parquet::TableMetadata metadata;
+  if (!resolve_runtime_metadata_or_error(name, &metadata) ||
+      !validate_catalog_or_error(metadata)) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
+
+  std::string error;
+  parquet::ParquetCatalogClient catalog_client(metadata.catalog_config);
+  if (!bootstrap_catalog_or_error(&catalog_client, &error)) {
+    raise_unknown_error(error);
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
  const std::string lakekeeper_url = lakekeeper_table_url(metadata);
 
  CURL *curl = curl_easy_init();
@@ -817,6 +927,12 @@ int ha_parquet::delete_table(const char *name)
      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
    }
 
+  auto status = catalog_client.DropTable(metadata.catalog_table_ident);
+  if (!status.ok() && status.code != parquet::CatalogStatusCode::kNotFound) {
+    raise_unknown_error(catalog_status_message(
+        "failed to drop Iceberg REST catalog table", status));
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
    if (http_code != 200 && http_code != 204 && http_code != 404) {
      parquet_log_warning("LakeKeeper delete table HTTP error: " +
                          std::to_string(http_code));
@@ -828,9 +944,9 @@ int ha_parquet::delete_table(const char *name)
                     "' http_status=" + std::to_string(http_code));
  }
 
- std::remove((table_path + ".parquet").c_str());
- std::remove((table_path + ".parquet.meta").c_str());
- DBUG_RETURN(0);
+  std::remove((table_path + ".parquet").c_str());
+  std::remove((table_path + ".parquet.meta").c_str());
+  DBUG_RETURN(0);
 }
 
 int ha_parquet::write_row(const uchar *buf)
@@ -842,31 +958,51 @@ int ha_parquet::write_row(const uchar *buf)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
-  parquet_trx_data *trx =
-      static_cast<parquet_trx_data *>(thd_get_ha_data(thd, parquet_hton));
-  if (trx == nullptr) {
-    trx = new parquet_trx_data();
-    thd_set_ha_data(thd, parquet_hton, trx);
+  parquet::ParquetTxnState *txn =
+      parquet::GetOrCreateTxnState(thd, parquet_hton);
+  if (txn == nullptr) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
+  txn->registered_with_server = true;
 
-  parquet_table_trx_data *table_trx =
-      parquet_table_txn_for_share(trx, thd, table->s);
-  if (table_trx == nullptr) {
+  parquet::ParquetTableTxnState *table_state =
+      parquet::GetOrCreateTableTxnState(txn, table->s);
+  if (table_state == nullptr) {
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
-  const std::string desired_buffer_name =
-      parquet_statement_buffer_name(thd, table->s->normalized_path.str);
-  if (!table_trx->statement_buffer_name.empty() &&
-      table_trx->statement_buffer_name != desired_buffer_name) {
-    parquet_reset_statement_buffer(table_trx);
+  const std::string desired_buffer_name = parquet::StatementBufferName(
+      static_cast<unsigned long long>(thd->thread_id),
+      static_cast<unsigned long long>(thd->query_id),
+      table->s->normalized_path.str);
+  if (!table_state->statement_buffer_name.empty() &&
+      table_state->statement_buffer_name != desired_buffer_name) {
+    parquet::ResetStatementBuffer(table_state);
   }
-  if (table_trx->statement_buffer_name != desired_buffer_name) {
-    table_trx->statement_buffer_name = desired_buffer_name;
-    table_trx->statement_row_count = 0;
+  if (table_state->statement_buffer_name != desired_buffer_name) {
+    table_state->statement_buffer_name = desired_buffer_name;
+    table_state->statement_row_count = 0;
   }
 
   try {
+    std::lock_guard<std::mutex> lock(parquet::parquet_duckdb_mutex());
+    std::string connection_error;
+    duckdb::Connection *connection =
+        parquet::parquet_handler_connection_locked(&connection_error);
+    if (connection == nullptr) {
+      std::cerr << "DuckDB connection error: " << connection_error
+                << std::endl;
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
+
+    if (!parquet::AppendRecordToStatementBufferLocked(
+            table_state, table, buf, connection, &connection_error)) {
+      std::cerr << "DuckDB appender row error: " << connection_error
+                << std::endl;
+      if (connection_error.find("unsupported MariaDB column type") !=
+          std::string::npos) {
+        DBUG_RETURN(HA_ERR_UNSUPPORTED);
+      }
     std::lock_guard<std::mutex> lock(g_duckdb_mutex);
     auto con = std::make_unique<duckdb::Connection>(*g_duckdb);
 
@@ -910,15 +1046,13 @@ int ha_parquet::write_row(const uchar *buf)
                           (result ? result->GetError() : "null result"));
       DBUG_RETURN(HA_ERR_GENERIC);
     }
-
-    table_trx->statement_row_count++;
     parquet_log_info("DuckDB buffered row table='" +
                      std::string(table->s->table_name.str) +
                      "' statement_rows=" +
-                     std::to_string(table_trx->statement_row_count));
-
-  } catch (const std::exception &e) {
-    parquet_log_warning(std::string("write_row exception: ") + e.what());
+                     std::to_string(table_state->statement_row_count));
+  } catch (const std::exception &ex) {
+    std::cerr << "write_row exception: " << ex.what() << std::endl;
+    parquet::ResetStatementBuffer(table_state);
     DBUG_RETURN(HA_ERR_GENERIC);
   }
 
@@ -927,7 +1061,6 @@ int ha_parquet::write_row(const uchar *buf)
 
 int ha_parquet::update_row(const uchar *, const uchar *) { return HA_ERR_WRONG_COMMAND; }
 int ha_parquet::delete_row(const uchar *) { return HA_ERR_WRONG_COMMAND; }
-
 
 int ha_parquet::rnd_init(bool scan)
 {
@@ -944,12 +1077,13 @@ int ha_parquet::rnd_init(bool scan)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
-  std::string response_body;
-  long http_code = 0;
-  if (!fetch_lakekeeper_table_metadata(metadata, &response_body, &http_code)) {
-    parquet_log_warning("rnd_init: failed to fetch LakeKeeper metadata");
+  std::vector<std::string> scan_paths;
+  std::string error;
+  if (!resolve_parquet_scan_paths(&metadata, &scan_paths, &error)) {
+    raise_unknown_error(error);
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
+  if (scan_paths.empty()) {
   if (http_code != 200) {
     parquet_log_warning("rnd_init: LakeKeeper table load HTTP error: " +
                         std::to_string(http_code));
@@ -963,20 +1097,21 @@ int ha_parquet::rnd_init(bool scan)
     DBUG_RETURN(0);
   }
 
-  std::string parquet_file_list = "[";
-  for (size_t i = 0; i < s3_files.size(); ++i) {
-    if (i != 0) parquet_file_list += ", ";
-    parquet_file_list += quote_string_literal(s3_files[i]);
-  }
-  parquet_file_list += "]";
-
-  std::string query = "SELECT * FROM read_parquet(" + parquet_file_list + ")";
-
+  std::string query = parquet::BuildDuckDBReadParquetSql(scan_paths);
   if (has_pushed_cond && !pushed_cond_sql.empty()) {
     query += " WHERE " + pushed_cond_sql;
   }
 
   try {
+    std::lock_guard<std::mutex> lock(parquet::parquet_duckdb_mutex());
+    std::string connection_error;
+    duckdb::Connection *connection =
+        parquet::parquet_handler_connection_locked(&connection_error);
+    if (connection == nullptr) {
+      raise_unknown_error(connection_error);
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
+    if (!configure_duckdb_s3(connection, metadata.object_store_config, &error)) {
     std::lock_guard<std::mutex> lock(g_duckdb_mutex);
     auto con = std::make_unique<duckdb::Connection>(*g_duckdb);
     std::string error;
@@ -987,7 +1122,7 @@ int ha_parquet::rnd_init(bool scan)
 
     parquet_log_info("DuckDB query [read/scan] " +
                      parquet_log_preview(query));
-    auto result = con->Query(query);
+    auto result = connection->Query(query);
     if (!result || result->HasError()) {
       parquet_log_warning("rnd_init read error: " +
                           (result ? result->GetError() : "null result"));
@@ -1005,175 +1140,156 @@ int ha_parquet::rnd_init(bool scan)
 
 int ha_parquet::rnd_next(uchar *buf)
 {
- (void) buf;
- DBUG_ENTER("ha_parquet::rnd_next");
+  (void) buf;
+  DBUG_ENTER("ha_parquet::rnd_next");
 
+  if (!scan_result || current_row >= scan_result->RowCount()) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  }
 
- if (!scan_result || current_row >= scan_result->RowCount())
-   DBUG_RETURN(HA_ERR_END_OF_FILE);
+  for (uint i = 0; i < table->s->fields; i++) {
+    Field *field = table->field[i];
+    auto value = scan_result->GetValue(i, current_row);
+    std::string error;
+    if (!parquet::StoreDuckDBValueInMariaDBField(field, value, table->in_use,
+                                                 &error)) {
+      raise_unknown_error(error);
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
+  }
 
-
- for (uint i = 0; i < table->s->fields; i++) {
-   Field *f = table->field[i];
-   auto val = scan_result->GetValue(i, current_row);
-
-   if (val.IsNull()) {
-     f->set_null();
-     continue;
-   }
-
-   f->set_notnull();
-
-
-   enum_field_types t = f->type();
-   if (t == MYSQL_TYPE_TINY || t == MYSQL_TYPE_SHORT ||
-       t == MYSQL_TYPE_INT24 || t == MYSQL_TYPE_LONG)
-     f->store((longlong)val.GetValue<int32_t>(), false);
-   else if (t == MYSQL_TYPE_LONGLONG)
-     f->store((longlong)val.GetValue<int64_t>(), false);
-   else if (t == MYSQL_TYPE_FLOAT || t == MYSQL_TYPE_DOUBLE)
-     f->store(val.GetValue<double>());
-   else {
-     std::string s = val.ToString();
-     f->store(s.c_str(), s.length(), f->charset());
-   }
- }
-
-
- current_row++;
- DBUG_RETURN(0);
+  current_row++;
+  DBUG_RETURN(0);
 }
-
 
 int ha_parquet::rnd_pos(uchar *, uchar *) { return HA_ERR_WRONG_COMMAND; }
 void ha_parquet::position(const uchar *) {}
 int ha_parquet::info(uint) { return 0; }
 
-
 enum_alter_inplace_result
 ha_parquet::check_if_supported_inplace_alter(TABLE *, Alter_inplace_info *)
 { return HA_ALTER_INPLACE_NOT_SUPPORTED; }
 
-
 int ha_parquet::external_lock(THD *thd, int lock_type)
 {
- DBUG_ENTER("ha_parquet::external_lock");
- 
- 
- if (lock_type == F_RDLCK || lock_type == F_WRLCK) {
-   if (lock_type == F_WRLCK) {
-     parquet::TableMetadata metadata;
-     if (!resolve_runtime_metadata_or_error(table_share->normalized_path.str,
-                                            &metadata) ||
-         !validate_catalog_or_error(metadata) ||
-         !validate_object_store_or_error(metadata)) {
-       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
-     }
-   }
-   trans_register_ha(thd, false, parquet_hton, 0);  
-   if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))  
-     trans_register_ha(thd, true, parquet_hton, 0);                  
-   if (lock_type == F_WRLCK) {
-     parquet_trx_data *trx =
-         static_cast<parquet_trx_data *>(thd_get_ha_data(thd, parquet_hton));
-     if (trx == NULL) {
-       trx = new parquet_trx_data();
-       thd_set_ha_data(thd, parquet_hton, trx);
-     }
-     parquet_table_trx_data *table_trx =
-         parquet_table_txn_for_share(trx, thd, table_share);
-     if (table_trx == nullptr) {
-       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
-     }
-     const std::string desired_buffer_name =
-         parquet_statement_buffer_name(thd, table_share->normalized_path.str);
-     if (!table_trx->statement_buffer_name.empty() &&
-         table_trx->statement_buffer_name != desired_buffer_name) {
-       parquet_reset_statement_buffer(table_trx);
-     }
-     if (table_trx->statement_buffer_name != desired_buffer_name) {
-       table_trx->statement_buffer_name = desired_buffer_name;
-       table_trx->statement_row_count = 0;
-       parquet_log_info("Parquet registered write statement table='" +
-                        table_trx->table_name + "' buffer='" +
-                        table_trx->statement_buffer_name + "' query_id=" +
-                        std::to_string(static_cast<unsigned long long>(
-                            thd->query_id)));
-     }
-   }
- }
- 
- 
- DBUG_RETURN(0);
+  DBUG_ENTER("ha_parquet::external_lock");
+
+  if (lock_type == F_RDLCK || lock_type == F_WRLCK) {
+    if (lock_type == F_WRLCK) {
+      parquet::TableMetadata metadata;
+      if (!resolve_runtime_metadata_or_error(table_share->normalized_path.str,
+                                             &metadata) ||
+          !validate_catalog_or_error(metadata) ||
+          !validate_object_store_or_error(metadata)) {
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+      }
+    }
+
+    trans_register_ha(thd, false, parquet_hton, 0);
+    if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
+      trans_register_ha(thd, true, parquet_hton, 0);
+    }
+
+    if (lock_type == F_WRLCK) {
+      parquet::ParquetTxnState *txn =
+          parquet::GetOrCreateTxnState(thd, parquet_hton);
+      if (txn == nullptr) {
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+      }
+      txn->registered_with_server = true;
+      parquet::ParquetTableTxnState *table_state =
+          parquet::GetOrCreateTableTxnState(txn, table_share);
+      if (table_state == nullptr) {
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+      }
+
+      const std::string desired_buffer_name = parquet::StatementBufferName(
+          static_cast<unsigned long long>(thd->thread_id),
+          static_cast<unsigned long long>(thd->query_id),
+          table_share->normalized_path.str);
+      if (!table_state->statement_buffer_name.empty() &&
+          table_state->statement_buffer_name != desired_buffer_name) {
+        parquet::ResetStatementBuffer(table_state);
+      }
+      if (table_state->statement_buffer_name != desired_buffer_name) {
+        table_state->statement_buffer_name = desired_buffer_name;
+        table_state->statement_row_count = 0;
+        parquet_log_info("Parquet registered write statement table='" +
+                         table_state->table_name + "' buffer='" +
+                         table_state->statement_buffer_name + "' query_id=" +
+                         std::to_string(static_cast<unsigned long long>(
+                             thd->query_id)));
+      }
+    }
+  }
+
+  DBUG_RETURN(0);
 }
 
-
-THR_LOCK_DATA **ha_parquet::store_lock(THD *thd, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_parquet::store_lock(THD *, THR_LOCK_DATA **to,
                                        enum thr_lock_type lock_type)
 {
- if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK)
-   lock.type = lock_type;
- *to++ = &lock;
- return to;
+  if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK)
+    lock.type = lock_type;
+  *to++ = &lock;
+  return to;
 }
-
 
 static handler *parquet_create_handler(handlerton *p_hton, TABLE_SHARE *table,
                                        MEM_ROOT *mem_root)
-{ return new (mem_root) ha_parquet(p_hton, table); }
-
+{
+  return new (mem_root) ha_parquet(p_hton, table);
+}
 
 static int ha_parquet_commit(THD *thd, bool all)
 {
- parquet_trx_data *trx =
-   static_cast<parquet_trx_data *>(thd_get_ha_data(thd, parquet_hton));
- if (!trx) return 0;
+  parquet::ParquetTxnState *txn =
+      parquet::GetTxnState(thd, parquet_hton);
+  if (!txn) return 0;
 
- std::string stage_error;
- bool has_pending_work = false;
- int pending_table_count = 0;
- for (auto &entry : trx->tables) {
-   parquet_table_trx_data &table_trx = entry.second;
-   if (table_trx.statement_row_count != 0 &&
-       !parquet_stage_statement_buffer_to_local(
-           &table_trx, table_trx.table_path + ".parquet", &stage_error)) {
-     raise_unknown_error("Failed to stage Parquet statement rows locally: " +
-                         stage_error);
-     return 1;
-   }
-   if (!table_trx.staged_files.empty()) {
-     has_pending_work = true;
-     pending_table_count++;
-   }
+  std::string stage_error;
+  for (auto &entry : txn->tables) {
+    parquet::ParquetTableTxnState &table_state = entry.second;
+    if (table_state.statement_row_count != 0 &&
+        !parquet::StageStatementBufferToLocal(
+            &table_state, table_state.table_path + ".parquet", &stage_error)) {
+      raise_unknown_error("Failed to stage Parquet statement rows locally: " +
+                          stage_error);
+      txn->has_error = true;
+      return 1;
+    }
   }
 
- if (!parquet_is_real_commit(thd, all)) {
-   if (has_pending_work) {
-     parquet_log_info(
-         "Parquet statement commit complete; remote flush deferred until "
-         "transaction commit tables=" +
-         std::to_string(pending_table_count));
-   }
-   return 0;
- }
+  int pending_table_count = 0;
+  const bool pending = has_pending_work(*txn, &pending_table_count);
 
- if (!has_pending_work) {
-   parquet_log_info("Parquet transaction commit has no staged write work");
-   delete trx;
-   thd_set_ha_data(thd, parquet_hton, nullptr);
-   return 0;
- }
+  if (!is_real_commit(thd, all)) {
+    if (pending) {
+      parquet_log_info(
+          "Parquet statement commit complete; remote flush deferred until "
+          "transaction commit tables=" + std::to_string(pending_table_count));
+    }
+    return 0;
+  }
 
- if (pending_table_count > 1) {
-   raise_unknown_error(
-       "Parquet currently supports committing writes to only one table per "
-       "transaction");
-   return 1;
- }
+  if (!pending) {
+    parquet_log_info("Parquet transaction commit has no staged write work");
+    parquet::ClearTxnState(thd, parquet_hton);
+    return 0;
+  }
 
- parquet_log_info("Parquet transaction commit begin tables=" +
-                  std::to_string(pending_table_count));
+  parquet_log_info("Parquet transaction commit begin tables=" +
+                   std::to_string(pending_table_count));
 
+  std::vector<CommitWork> works;
+  works.reserve(pending_table_count);
+  std::string error;
+  for (auto &entry : txn->tables) {
+    parquet::ParquetTableTxnState &table_state = entry.second;
+    if (table_state.local_stage_files.empty() &&
+        table_state.staged_files.empty()) {
+      continue;
+    }
  static std::atomic<long long> snapshot_counter{0};
  for (auto &entry : trx->tables) {
    parquet_table_trx_data &table_trx = entry.second;
@@ -1181,6 +1297,33 @@ static int ha_parquet_commit(THD *thd, bool all)
      continue;
    }
 
+    CommitWork work;
+    if (!prepare_commit_metadata(&table_state, &work, &error)) {
+      raise_unknown_error(error);
+      txn->has_error = true;
+      return 1;
+    }
+    if (!works.empty() &&
+        !catalog_configs_compatible(works.front().metadata.catalog_config,
+                                    work.metadata.catalog_config)) {
+      raise_unknown_error(
+          "Parquet multi-table commits require all tables to use the same "
+          "Iceberg REST catalog configuration");
+      txn->has_error = true;
+      return 1;
+    }
+    works.push_back(std::move(work));
+  }
+
+  if (works.size() > 1 &&
+      !works.front().catalog_client->capabilities()
+           .supports_commit_transaction) {
+    raise_unknown_error(
+        "Parquet multi-table commits require Iceberg REST transaction commit "
+        "support from the catalog");
+    txn->has_error = true;
+    return 1;
+  }
    parquet::TableMetadata metadata;
    if (!resolve_runtime_metadata_or_error(table_trx.table_path.c_str(),
                                           &metadata) ||
@@ -1241,6 +1384,23 @@ static int ha_parquet_commit(THD *thd, bool all)
      return 1;
    }
 
+  for (auto &work : works) {
+    if (!materialize_upload_and_build_artifacts(&work, &error)) {
+      for (auto &cleanup_work : works) {
+        cleanup_uploaded_objects(cleanup_work.table_state,
+                                 cleanup_work.metadata);
+      }
+      raise_unknown_error(error);
+      txn->has_error = true;
+      return 1;
+    }
+  }
+
+  if (!commit_prepared_work(&works, &error)) {
+    raise_unknown_error(error);
+    txn->has_error = true;
+    return 1;
+  }
    struct curl_slist *headers = NULL;
    headers = curl_slist_append(headers, "Content-Type: application/json");
    curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -1273,44 +1433,49 @@ static int ha_parquet_commit(THD *thd, bool all)
      return 1;
    }
 
-   parquet_log_info("LakeKeeper commit complete table='" +
-                    table_trx.table_name + "' snapshot_id=" +
-                    std::to_string(snapshot_id) + " http_status=" +
-                    std::to_string(http_code));
-   parquet_remove_local_stage_files(&table_trx);
-   table_trx.uploaded_s3_file_paths.clear();
- }
+  for (auto &work : works) {
+    parquet::RemoveLocalFiles(work.table_state);
+    work.table_state->uploaded_objects.clear();
+  }
 
- parquet_log_info("Parquet transaction commit complete");
- delete trx;
- thd_set_ha_data(thd, parquet_hton, nullptr);
- return 0;
+  parquet_log_info("Parquet transaction commit complete");
+  parquet::ClearTxnState(thd, parquet_hton);
+  return 0;
 }
-
 
 static int ha_parquet_rollback(THD *thd, bool all)
 {
-    parquet_trx_data *trx =
-        static_cast<parquet_trx_data *>(thd_get_ha_data(thd, parquet_hton));
-    if (!trx) return 0;
+  parquet::ParquetTxnState *txn =
+      parquet::GetTxnState(thd, parquet_hton);
+  if (!txn) return 0;
 
-    const bool real_rollback = parquet_is_real_rollback(thd, all);
-    parquet_log_info(std::string("Parquet rollback begin scope='") +
-                     (real_rollback ? "transaction" : "statement") + "'");
-    int error = 0;
-    for (auto &entry : trx->tables) {
-        parquet_table_trx_data &table_trx = entry.second;
-        parquet_reset_statement_buffer(&table_trx);
+  const bool real_rollback = is_real_rollback(thd, all);
+  parquet_log_info(std::string("Parquet rollback begin scope='") +
+                   (real_rollback ? "transaction" : "statement") + "'");
+  int error = 0;
+  for (auto &entry : txn->tables) {
+    parquet::ParquetTableTxnState &table_state = entry.second;
+    parquet::ResetStatementBuffer(&table_state);
 
-        if (!real_rollback) {
-            continue;
-        }
+    if (!real_rollback) {
+      continue;
+    }
 
-        parquet_remove_local_stage_files(&table_trx);
-        if (table_trx.uploaded_s3_file_paths.empty()) {
-            continue;
-        }
-
+    parquet::TableMetadata metadata;
+    if (!table_state.uploaded_objects.empty()) {
+      std::string metadata_error;
+      if (parquet::ResolveRuntimeTableMetadata(table_state.table_path.c_str(),
+                                               &metadata, &metadata_error) &&
+          parquet::ValidateObjectStoreConfig(metadata, true, &metadata_error)) {
+        cleanup_uploaded_objects(&table_state, metadata);
+      } else {
+        std::cerr << "rollback: failed to resolve object-store metadata: "
+                  << metadata_error << std::endl;
+        error = 1;
+      }
+    }
+    parquet::RemoveLocalFiles(&table_state);
+  }
         parquet::TableMetadata metadata;
         if (!resolve_runtime_metadata_or_error(table_trx.table_path.c_str(),
                                                &metadata) ||
@@ -1344,30 +1509,37 @@ static int ha_parquet_rollback(THD *thd, bool all)
         }
     }
 
-    if (real_rollback) {
-        delete trx;
-        thd_set_ha_data(thd, parquet_hton, nullptr);
-    }
-    parquet_log_info("Parquet rollback complete");
-    return error;
+  if (real_rollback) {
+    parquet::ClearTxnState(thd, parquet_hton);
+  }
+  parquet_log_info("Parquet rollback complete");
+  return error;
 }
 
 static int ha_parquet_init(void *p)
 {
- parquet_hton = (handlerton *) p;
- parquet_hton->create   = parquet_create_handler;
- parquet_hton->create_select = create_duckdb_select_handler;
- parquet_hton->commit   = ha_parquet_commit;
- parquet_hton->rollback = ha_parquet_rollback;
- parquet_hton->table_options = parquet_table_option_list;
- thr_lock_init(&parquet_lock);
+  parquet_hton = (handlerton *) p;
+  parquet_hton->create = parquet_create_handler;
+  parquet_hton->create_select = create_duckdb_select_handler;
+  parquet_hton->commit = ha_parquet_commit;
+  parquet_hton->rollback = ha_parquet_rollback;
+  parquet_hton->table_options = parquet_table_option_list;
+  thr_lock_init(&parquet_lock);
 
- /* Mirror S3: copy startup-only secret sysvars into runtime globals and mask
-    SHOW VARIABLES output before any table metadata resolution happens. */
- update_lakekeeper_bearer_token(0, 0, 0, 0);
- update_s3_access_key_id(0, 0, 0, 0);
- update_s3_secret_access_key(0, 0, 0, 0);
+  update_lakekeeper_bearer_token(0, 0, 0, 0);
+  update_s3_access_key_id(0, 0, 0, 0);
+  update_s3_secret_access_key(0, 0, 0, 0);
 
+  std::string duckdb_error;
+  if (!parquet::parquet_init_shared_duckdb_runtime(&duckdb_error)) {
+    parquet_log_warning("DuckDB runtime initialization failed: " +
+                        duckdb_error);
+    parquet_hton = 0;
+    thr_lock_delete(&parquet_lock);
+    return 1;
+  }
+  parquet_log_info("DuckDB global instance initialized");
+  return 0;
 
  g_duckdb = new duckdb::DuckDB(nullptr);
  parquet_log_info("DuckDB global instance initialized");
@@ -1384,36 +1556,32 @@ static int ha_parquet_init(void *p)
  return 0;
 }
 
-
-static int ha_parquet_deinit(void *p)
+static int ha_parquet_deinit(void *)
 {
- delete g_duckdb;
- g_duckdb = nullptr;
- parquet_log_info("DuckDB global instance deinitialized");
- parquet_hton = 0;
- thr_lock_delete(&parquet_lock);
- return 0;
+  parquet::parquet_deinit_shared_duckdb_runtime();
+  parquet_log_info("DuckDB global instance deinitialized");
+  parquet_hton = 0;
+  thr_lock_delete(&parquet_lock);
+  return 0;
 }
-
 
 struct st_mysql_storage_engine parquet_storage_engine =
 { MYSQL_HANDLERTON_INTERFACE_VERSION };
 
-
 maria_declare_plugin(parquet)
 {
- MYSQL_STORAGE_ENGINE_PLUGIN,
- &parquet_storage_engine,
- "PARQUET",
- "UIUC Disruption Lab",
- "Parquet Storage Engine",
- PLUGIN_LICENSE_GPL,
- ha_parquet_init,
- ha_parquet_deinit,
- 0x0100,
- NULL,
- parquet_system_variables,
- "1.0",
- MariaDB_PLUGIN_MATURITY_STABLE
+  MYSQL_STORAGE_ENGINE_PLUGIN,
+  &parquet_storage_engine,
+  "PARQUET",
+  "MariaDB",
+  "Parquet storage engine backed by DuckDB and Iceberg REST catalog",
+  PLUGIN_LICENSE_GPL,
+  ha_parquet_init,
+  ha_parquet_deinit,
+  0x0100,
+  NULL,
+  parquet_system_variables,
+  "1.0",
+  MariaDB_PLUGIN_MATURITY_EXPERIMENTAL
 }
 maria_declare_plugin_end;

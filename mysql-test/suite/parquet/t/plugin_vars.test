@@ -1,3 +1,7 @@
+--disable_query_log
+call mtr.add_suppression("Internal memory accounting error of [0-9]+ bytes");
+--enable_query_log
+
 show variables like 'parquet_lakekeeper_%';
 show variables like 'parquet_s3_%';
 
@@ -8,7 +12,8 @@ set @@parquet_s3_access_key_id='other-access';
 --error ER_INCORRECT_GLOBAL_LOCAL_VAR
 set @@parquet_lakekeeper_bearer_token='other-token';
 
-create database if not exists test;
+drop database if exists test;
+create database test;
 use test;
 
 --error ER_ILLEGAL_HA_CREATE_OPTION

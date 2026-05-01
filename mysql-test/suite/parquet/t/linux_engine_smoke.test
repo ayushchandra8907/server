@@ -1,9 +1,21 @@
 --echo # Parquet engine startup smoke test
 
-eval INSTALL PLUGIN parquet SONAME '$HA_PARQUET_SO';
+--disable_query_log
+call mtr.add_suppression("Internal memory accounting error of [0-9]+ bytes");
+--enable_query_log
+
+if ($HA_PARQUET_SO) {
+  --disable_query_log
+  eval INSTALL PLUGIN parquet SONAME '$HA_PARQUET_SO';
+  --enable_query_log
+}
 
 SELECT ENGINE, SUPPORT
 FROM information_schema.ENGINES
 WHERE ENGINE = 'PARQUET';
 
-UNINSTALL PLUGIN parquet;
+if ($HA_PARQUET_SO) {
+  --disable_query_log
+  UNINSTALL PLUGIN parquet;
+  --enable_query_log
+}
