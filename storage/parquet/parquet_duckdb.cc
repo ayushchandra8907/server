@@ -518,7 +518,7 @@ bool MaterializeLocalDataFile(ParquetTableTxnState *table_state,
     return false;
   }
 
-  file_size = ReadLocalFileSize(local_data_path);
+  file_size = git(local_data_path);
 
   *staged_file = {table_state->table_path,
                   table_state->table_name,
