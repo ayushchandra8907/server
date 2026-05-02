@@ -24,6 +24,30 @@ export TMP_DIR="${TMP_DIR:-$BUILD_DIR/parquet-tmp}"
 If your build directory is not `build/`, set `BUILD_DIR` first and the rest of
 the commands below will still work.
 
+## After running `scripts/build_parquet.sh`
+
+If you used the build script to get here, **skip straight to [Step 2](#2-put-parquet-startup-config-in-mariadb-parquetcnf)**. The script already handled everything in Step 1:
+
+- initialized submodules (`git submodule update --init --recursive`)
+- applied C++ compatibility patches to `parquet_cross_engine_scan.cc`
+- ran the full CMake configure with the correct plugin flags
+- compiled `mariadbd`, `ha_parquet.so`/`ha_parquet.dylib`, and the MTR helper
+- verified all three artifacts exist before exiting
+
+Quick reference for the script's flags:
+
+| Flag | When to use |
+|---|---|
+| `./scripts/build_parquet.sh` | Incremental rebuild (fastest for iterating) |
+| `./scripts/build_parquet.sh --clean` | Full rebuild from scratch |
+| `./scripts/build_parquet.sh --clean --test` | Full rebuild + runs the MTR smoke test |
+| `./scripts/build_parquet.sh --install-deps --clean` | First-time setup on a new machine |
+| `JOBS=4 ./scripts/build_parquet.sh` | Override the default 2-job cap |
+
+Once the script exits with `==> Build succeeded`, pick up at **Step 2** below.
+
+---
+
 ## 1. Build the new code
 
 From the repo root:
