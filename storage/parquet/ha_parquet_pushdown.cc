@@ -7,6 +7,7 @@
 #include "parquet_metadata.h"
 #include "parquet_schema.h"
 #include "parquet_shared.h"
+#include "parquet_write_buffer.h"
 
 #include "field.h"
 #include "log.h"
@@ -221,6 +222,11 @@ int ha_parquet_select_handler::init_scan()
       cleanup_external_registry();
       my_printf_error(ER_UNKNOWN_ERROR, "%s", MYF(0), error_message.c_str());
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    }
+
+    for (const auto &local_path : parquet::ParquetWriteBufferGetLocalPaths(
+             tbl->table->s->normalized_path.str)) {
+      scan_paths.push_back(local_path);
     }
 
     std::string create_view_sql;

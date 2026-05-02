@@ -47,6 +47,7 @@ MYSQL_ADD_PLUGIN(parquet
   parquet_metadata.cc
   parquet_object_store.cc
   parquet_transaction.cc
+  parquet_write_buffer.cc
   STORAGE_ENGINE
 )
 

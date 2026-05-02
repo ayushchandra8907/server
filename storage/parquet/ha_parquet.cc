@@ -10,6 +10,7 @@
 #include "parquet_schema.h"
 #include "parquet_shared.h"
 #include "parquet_transaction.h"
+#include "parquet_write_buffer.h"
 
 #include "handler.h"
 #include "my_sys.h"
@@ -19,9 +20,11 @@
 
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <ctime>
 #include <mutex>
+#include <thread>
 
 handlerton *parquet_hton = 0;
 
@@ -45,6 +48,8 @@ static ha_create_table_option parquet_table_option_list[] = {
 static char *parquet_tmp_lakekeeper_bearer_token = 0;
 static char *parquet_tmp_s3_access_key_id = 0;
 static char *parquet_tmp_s3_secret_access_key = 0;
+static uint32_t parquet_write_buffer_max_rows_value = 100000;
+static uint32_t parquet_write_buffer_flush_interval_ms_value = 30000;
 
 static void update_lakekeeper_bearer_token(MYSQL_THD,
                                            struct st_mysql_sys_var *,
@@ -127,6 +132,18 @@ static MYSQL_SYSVAR_STR(s3_secret_access_key,
                             PLUGIN_VAR_MEMALLOC,
                         "Parquet object-store secret access key", 0,
                         update_s3_secret_access_key, "");
+static MYSQL_SYSVAR_UINT(write_buffer_max_rows,
+                         parquet_write_buffer_max_rows_value,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Flush write buffer to S3 when buffered row count "
+                         "reaches this threshold (0 = flush on every commit)",
+                         0, 0, 100000, 0, UINT_MAX, 1);
+static MYSQL_SYSVAR_UINT(write_buffer_flush_interval_ms,
+                         parquet_write_buffer_flush_interval_ms_value,
+                         PLUGIN_VAR_RQCMDARG,
+                         "Background flush interval for the write buffer in "
+                         "milliseconds",
+                         0, 0, 30000, 1000, UINT_MAX, 1);
 
 static struct st_mysql_sys_var *parquet_system_variables[] = {
     MYSQL_SYSVAR(lakekeeper_base_url),
@@ -138,6 +155,8 @@ static struct st_mysql_sys_var *parquet_system_variables[] = {
     MYSQL_SYSVAR(s3_region),
     MYSQL_SYSVAR(s3_access_key_id),
     MYSQL_SYSVAR(s3_secret_access_key),
+    MYSQL_SYSVAR(write_buffer_max_rows),
+    MYSQL_SYSVAR(write_buffer_flush_interval_ms),
     NULL};
 
 const ha_table_option_struct *parquet_table_options(HA_CREATE_INFO *create_info)
@@ -552,6 +571,106 @@ bool commit_prepared_work(std::vector<CommitWork> *works, std::string *error)
   return true;
 }
 
+static int parquet_flush_table_buffer(
+    const std::string &table_path,
+    const std::string &table_name,
+    std::vector<parquet::ParquetBufferedFile> buffered_files)
+{
+  if (buffered_files.empty()) {
+    return 0;
+  }
+
+  parquet_log_info("Parquet write buffer flush begin table='" + table_name +
+                   "' files=" + std::to_string(buffered_files.size()));
+
+  parquet::ParquetTableTxnState table_state;
+  table_state.table_path = table_path;
+  table_state.table_name = table_name;
+  for (const auto &buf_file : buffered_files) {
+    parquet::ParquetStagedFile staged;
+    staged.table_path         = table_path;
+    staged.table_name         = table_name;
+    staged.local_parquet_path = buf_file.local_path;
+    staged.target_object_path = buf_file.target_s3_path;
+    staged.record_count       = buf_file.row_count;
+    staged.file_size_bytes    = buf_file.file_size_bytes;
+    table_state.staged_files.push_back(staged);
+  }
+
+  CommitWork work;
+  std::string error;
+  if (!prepare_commit_metadata(&table_state, &work, &error)) {
+    parquet_log_warning("write buffer flush: prepare failed for table='" +
+                        table_name + "': " + error);
+    return 1;
+  }
+
+  if (!materialize_upload_and_build_artifacts(&work, &error)) {
+    cleanup_uploaded_objects(&table_state, work.metadata);
+    parquet_log_warning("write buffer flush: upload failed for table='" +
+                        table_name + "': " + error);
+    return 1;
+  }
+
+  std::vector<CommitWork> works;
+  works.push_back(std::move(work));
+  if (!commit_prepared_work(&works, &error)) {
+    parquet_log_warning("write buffer flush: catalog commit failed for table='" +
+                        table_name + "': " + error);
+    return 1;
+  }
+
+  for (const auto &buf_file : buffered_files) {
+    if (!buf_file.local_path.empty()) {
+      std::remove(buf_file.local_path.c_str());
+    }
+  }
+  parquet::RemoveLocalFiles(&table_state);
+
+  parquet_log_info("Parquet write buffer flush complete table='" + table_name + "'");
+  return 0;
+}
+
+static std::atomic<bool> g_buffer_flush_stop{false};
+static std::mutex g_buffer_flush_cv_mutex;
+static std::condition_variable g_buffer_flush_cv;
+static std::thread g_buffer_flush_thread;
+
+static void parquet_buffer_flush_thread_func()
+{
+  parquet_log_info("Parquet write buffer flush thread started");
+  while (true) {
+    std::unique_lock<std::mutex> lock(g_buffer_flush_cv_mutex);
+    g_buffer_flush_cv.wait_for(
+        lock,
+        std::chrono::milliseconds(
+            static_cast<int64_t>(parquet_write_buffer_flush_interval_ms_value)),
+        [] { return g_buffer_flush_stop.load(); });
+
+    if (g_buffer_flush_stop.load()) {
+      break;
+    }
+    lock.unlock();
+
+    const auto stale = parquet::ParquetWriteBufferStaleTables(
+        static_cast<uint64_t>(parquet_write_buffer_flush_interval_ms_value));
+
+    for (const auto &table_path : stale) {
+      std::string table_name;
+      std::vector<parquet::ParquetBufferedFile> files;
+      if (!parquet::ParquetWriteBufferTake(table_path, &table_name, &files)) {
+        continue;
+      }
+      if (parquet_flush_table_buffer(table_path, table_name, std::move(files)) != 0) {
+        parquet_log_warning(
+            "Parquet write buffer background flush failed for table '" +
+            table_path + "'");
+      }
+    }
+  }
+  parquet_log_info("Parquet write buffer flush thread stopped");
+}
+
 } // namespace
 
 ha_parquet::ha_parquet(handlerton *hton, TABLE_SHARE *table_arg)
@@ -738,8 +857,7 @@ int ha_parquet::rnd_init(bool scan)
   parquet::TableMetadata metadata;
   if (!resolve_runtime_metadata_or_error(table->s->normalized_path.str,
                                          &metadata) ||
-      !validate_catalog_or_error(metadata) ||
-      !validate_object_store_or_error(metadata)) {
+      !validate_catalog_or_error(metadata)) {
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
@@ -749,9 +867,19 @@ int ha_parquet::rnd_init(bool scan)
     raise_unknown_error(error);
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
+
+  for (const auto &local_path : parquet::ParquetWriteBufferGetLocalPaths(
+           table->s->normalized_path.str)) {
+    scan_paths.push_back(local_path);
+  }
+
   if (scan_paths.empty()) {
     parquet_log_info("rnd_init: no scan paths found, returning empty scan");
     DBUG_RETURN(0);
+  }
+
+  if (!validate_object_store_or_error(metadata)) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
   }
 
   std::string query = parquet::BuildDuckDBReadParquetSql(scan_paths);
@@ -934,8 +1062,6 @@ static int ha_parquet_commit(THD *thd, bool all)
   parquet_log_info("Parquet transaction commit begin tables=" +
                    std::to_string(pending_table_count));
 
-  std::vector<CommitWork> works;
-  works.reserve(pending_table_count);
   std::string error;
   for (auto &entry : txn->tables) {
     parquet::ParquetTableTxnState &table_state = entry.second;
@@ -944,58 +1070,56 @@ static int ha_parquet_commit(THD *thd, bool all)
       continue;
     }
 
-    CommitWork work;
-    if (!prepare_commit_metadata(&table_state, &work, &error)) {
+    parquet::TableMetadata metadata;
+    if (!parquet::ResolveRuntimeTableMetadata(table_state.table_path.c_str(),
+                                              &metadata, &error) ||
+        !parquet::ValidateObjectStoreConfig(metadata, true, &error)) {
       raise_unknown_error(error);
       txn->has_error = true;
       return 1;
     }
-    if (!works.empty() &&
-        !catalog_configs_compatible(works.front().metadata.catalog_config,
-                                    work.metadata.catalog_config)) {
-      raise_unknown_error(
-          "Parquet multi-table commits require all tables to use the same "
-          "Iceberg REST catalog configuration");
+
+    parquet::ParquetStagedFile staged_file;
+    if (!parquet::MaterializeLocalDataFile(&table_state, metadata,
+                                           &staged_file, &error)) {
+      raise_unknown_error("Failed to materialize Parquet data file: " + error);
       txn->has_error = true;
       return 1;
     }
-    works.push_back(std::move(work));
-  }
 
-  if (works.size() > 1 &&
-      !works.front().catalog_client->capabilities()
-           .supports_commit_transaction) {
-    raise_unknown_error(
-        "Parquet multi-table commits require Iceberg REST transaction commit "
-        "support from the catalog");
-    txn->has_error = true;
-    return 1;
-  }
+    if (table_state.staged_files.empty()) {
+      continue;
+    }
 
-  for (auto &work : works) {
-    if (!materialize_upload_and_build_artifacts(&work, &error)) {
-      for (auto &cleanup_work : works) {
-        cleanup_uploaded_objects(cleanup_work.table_state,
-                                 cleanup_work.metadata);
+    parquet::ParquetBufferedFile buf_file;
+    buf_file.local_path       = staged_file.local_parquet_path;
+    buf_file.target_s3_path   = staged_file.target_object_path;
+    buf_file.row_count        = staged_file.record_count;
+    buf_file.file_size_bytes  = staged_file.file_size_bytes;
+    parquet::ParquetWriteBufferAppend(table_state.table_path,
+                                      table_state.table_name, buf_file);
+
+    if (parquet_write_buffer_max_rows_value == 0 ||
+        parquet::ParquetWriteBufferShouldFlush(
+            table_state.table_path,
+            static_cast<uint64_t>(parquet_write_buffer_max_rows_value))) {
+      std::string flush_table_name;
+      std::vector<parquet::ParquetBufferedFile> flush_files;
+      if (parquet::ParquetWriteBufferTake(table_state.table_path,
+                                          &flush_table_name, &flush_files)) {
+        if (parquet_flush_table_buffer(table_state.table_path, flush_table_name,
+                                       std::move(flush_files)) != 0) {
+          raise_unknown_error(
+              "Parquet write buffer flush failed for table '" +
+              table_state.table_name + "'");
+          txn->has_error = true;
+          return 1;
+        }
       }
-      raise_unknown_error(error);
-      txn->has_error = true;
-      return 1;
     }
   }
 
-  if (!commit_prepared_work(&works, &error)) {
-    raise_unknown_error(error);
-    txn->has_error = true;
-    return 1;
-  }
-
-  for (auto &work : works) {
-    parquet::RemoveLocalFiles(work.table_state);
-    work.table_state->uploaded_objects.clear();
-  }
-
-  parquet_log_info("Parquet transaction commit complete");
+  parquet_log_info("Parquet transaction commit complete (buffered)");
   parquet::ClearTxnState(thd, parquet_hton);
   return 0;
 }
@@ -1064,11 +1188,34 @@ static int ha_parquet_init(void *p)
     return 1;
   }
   parquet_log_info("DuckDB global instance initialized");
+
+  parquet::ParquetWriteBufferInit();
+  g_buffer_flush_stop.store(false);
+  g_buffer_flush_thread = std::thread(parquet_buffer_flush_thread_func);
   return 0;
 }
 
 static int ha_parquet_deinit(void *)
 {
+  {
+    std::lock_guard<std::mutex> lock(g_buffer_flush_cv_mutex);
+    g_buffer_flush_stop.store(true);
+  }
+  g_buffer_flush_cv.notify_one();
+  if (g_buffer_flush_thread.joinable()) {
+    g_buffer_flush_thread.join();
+  }
+
+  const auto remaining = parquet::ParquetWriteBufferStaleTables(0);
+  for (const auto &table_path : remaining) {
+    std::string table_name;
+    std::vector<parquet::ParquetBufferedFile> files;
+    if (parquet::ParquetWriteBufferTake(table_path, &table_name, &files)) {
+      parquet_flush_table_buffer(table_path, table_name, std::move(files));
+    }
+  }
+
+  parquet::ParquetWriteBufferDeinit();
   parquet::parquet_deinit_shared_duckdb_runtime();
   parquet_log_info("DuckDB global instance deinitialized");
   parquet_hton = 0;
