@@ -55,6 +55,14 @@ OS_NAME="$(uname -s)"
 
 if [[ "$OS_NAME" == "Linux" ]]; then
   CPU_COUNT="$(nproc)"
+  
+  # Dynamically detect and use gcc-11 if available (resolves unique_ptr compilation errors on older distros)
+  if command -v gcc-11 >/dev/null 2>&1; then
+    echo "==> GCC-11 detected. Exporting CC and CXX environment variables."
+    export CC=gcc-11
+    export CXX=g++-11
+  fi
+
 elif [[ "$OS_NAME" == "Darwin" ]]; then
   CPU_COUNT="$(sysctl -n hw.ncpu)"
 else
@@ -64,9 +72,6 @@ fi
 
 # DuckDB compilation is memory-heavy.
 # Default to max 2 jobs to avoid cc1plus getting killed.
-# Override manually with:
-#   JOBS=1 ./scripts/build_parquet.sh --clean --test
-#   JOBS=4 ./scripts/build_parquet.sh --clean --test
 if [[ -z "${JOBS:-}" ]]; then
   if [[ "$CPU_COUNT" -gt 2 ]]; then
     JOBS=2
@@ -104,7 +109,8 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
       ninja-build \
       perl \
       pkg-config \
-      zlib1g-dev
+      zlib1g-dev \
+      groff
   elif [[ "$OS_NAME" == "Darwin" ]]; then
     echo "==> Installing macOS dependencies"
 
@@ -123,12 +129,29 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
       pcre2 \
       pkg-config \
       snappy \
-      zlib
+      zlib \
+      groff
   fi
 fi
 
 echo "==> Updating submodules"
 git submodule update --init --recursive
+
+echo "==> Applying C++11/14 unique_ptr cross-platform patches..."
+PATCH_FILE="storage/parquet/parquet_cross_engine_scan.cc"
+if [[ -f "$PATCH_FILE" ]]; then
+  # Safely inject the utility header if it doesn't exist
+  if ! grep -q "#include <utility>" "$PATCH_FILE"; then
+    echo "#include <utility>" | cat - "$PATCH_FILE" > temp && mv temp "$PATCH_FILE"
+  fi
+
+  # Safely replace the return statements (using .bak avoids GNU vs BSD sed conflicts)
+  sed -i.bak 's/return copy;/return std::move(copy);/g' "$PATCH_FILE"
+  sed -i.bak 's/return data;/return std::move(data);/g' "$PATCH_FILE"
+  sed -i.bak 's/return state;/return std::move(state);/g' "$PATCH_FILE"
+  sed -i.bak 's/return ref;/return std::move(ref);/g' "$PATCH_FILE"
+  rm -f "${PATCH_FILE}.bak"
+fi
 
 if [[ "$CLEAN" -eq 1 ]]; then
   echo "==> Removing old build directory"
@@ -152,6 +175,7 @@ fi
 
 echo "==> Configuring MariaDB with Parquet as a dynamic plugin"
 
+# Note: CMAKE_C_COMPILER arguments are removed so CMake respects the environment variables
 cmake -S . -B "$BUILD_DIR" "${GENERATOR_ARGS[@]}" \
   -DCMAKE_CXX_STANDARD=17 \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
@@ -214,4 +238,3 @@ if [[ "$RUN_TEST" -eq 1 ]]; then
 
   echo "==> Smoke test passed"
 fi
-
