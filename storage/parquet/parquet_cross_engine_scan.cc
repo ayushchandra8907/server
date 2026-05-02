@@ -1,3 +1,4 @@
+#include <utility>
 #define MYSQL_SERVER 1
 
 #include <my_global.h>
@@ -180,7 +181,7 @@ struct MdbScanBindData : duckdb::FunctionData
     auto copy = duckdb::make_uniq<MdbScanBindData>();
     copy->table_key = table_key;
     copy->table = table;
-    return copy;
+    return std::move(copy);
   }
 
   bool Equals(const duckdb::FunctionData &other) const override
@@ -367,7 +368,7 @@ mdb_scan_bind(duckdb::ClientContext &context,
   auto data = duckdb::make_uniq<MdbScanBindData>();
   data->table_key = key;
   data->table = tbl;
-  return data;
+  return std::move(data);
 }
 
 static duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
@@ -382,7 +383,7 @@ mdb_scan_init_global(duckdb::ClientContext &context,
   if (input.filters)
     state->filters = input.filters->Copy();
   state->column_ids = input.column_ids;
-  return state;
+  return std::move(state);
 }
 
 static void mdb_scan_function(duckdb::ClientContext &context,
@@ -520,7 +521,7 @@ duckdb::unique_ptr<duckdb::TableRef> mariadb_replacement_scan(
   ref->function = duckdb::make_uniq<duckdb::FunctionExpression>(
       "_mdb_scan", std::move(children));
   ref->alias = input.table_name;
-  return ref;
+  return std::move(ref);
 }
 
 void register_cross_engine_scan(duckdb::DatabaseInstance &db)
