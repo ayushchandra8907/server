@@ -1,0 +1,26 @@
+var searchData=
+[
+  ['s3_5faccess_5fkey_5fid_0',['s3_access_key_id',['../struct_parquet_plugin_config_snapshot.html#ae5cf3abdb1ca5fff2431b6253bbb3130',1,'ParquetPluginConfigSnapshot']]],
+  ['s3_5fbucket_1',['s3_bucket',['../struct_parquet_plugin_config_snapshot.html#a58bdd81bef7bc06eeffba9878eb708e6',1,'ParquetPluginConfigSnapshot']]],
+  ['s3_5fdata_5fprefix_2',['s3_data_prefix',['../struct_parquet_plugin_config_snapshot.html#a66fa28d06824a3ec6832fd75fca198d9',1,'ParquetPluginConfigSnapshot']]],
+  ['s3_5fregion_3',['s3_region',['../struct_parquet_plugin_config_snapshot.html#af0d2543f2e2e40c8ca8fd8575b8c636e',1,'ParquetPluginConfigSnapshot']]],
+  ['s3_5fsecret_5faccess_5fkey_4',['s3_secret_access_key',['../struct_parquet_plugin_config_snapshot.html#a08c02052a8924cac2eb98439b2f9c13b',1,'ParquetPluginConfigSnapshot']]],
+  ['savetablemetadata_5',['SaveTableMetadata',['../namespaceparquet.html#a38ffbd0fdabf4e557c08377662f2a881',1,'parquet']]],
+  ['scan_5fstarted_6',['scan_started',['../structmyparquet_1_1_mdb_scan_global_state.html#a7397937ed0e77455d3b2c1eb705e6d5b',1,'myparquet::MdbScanGlobalState']]],
+  ['schema_5fjson_7',['schema_json',['../structparquet_1_1_catalog_table_metadata.html#adc763f8de202dc2f77ce3ee3116d42bc',1,'parquet::CatalogTableMetadata::schema_json'],['../structparquet_1_1_catalog_create_table_request.html#ab64beb27a50e5e474fa5e4362c0fab29',1,'parquet::CatalogCreateTableRequest::schema_json']]],
+  ['secret_5faccess_5fkey_8',['secret_access_key',['../structparquet_1_1_object_store_credentials.html#af5c95473cc54b4cbbafcc603ed043855',1,'parquet::ObjectStoreCredentials']]],
+  ['sequence_5fnumber_9',['sequence_number',['../structparquet_1_1_iceberg_commit_artifacts.html#aeb67ccd4b386cf66a608c09ec24f7a2f',1,'parquet::IcebergCommitArtifacts']]],
+  ['session_5ftoken_10',['session_token',['../structparquet_1_1_object_store_credentials.html#a2509a62750efbf50c816b0374f4153ff',1,'parquet::ObjectStoreCredentials']]],
+  ['set_5fcross_5fengine_11',['set_cross_engine',['../classha__parquet__select__handler.html#aac8c0fad1ad4c8b07913d69be4ac4563',1,'ha_parquet_select_handler']]],
+  ['set_5fparquet_5ftables_12',['set_parquet_tables',['../classha__parquet__select__handler.html#a6a351ba07ecfecaf97b1c00ea4d4476a',1,'ha_parquet_select_handler']]],
+  ['snapshot_5fid_13',['snapshot_id',['../structparquet_1_1_iceberg_commit_artifacts.html#a9a0c20ae94fbc5af5f8eb9c98544db1e',1,'parquet::IcebergCommitArtifacts::snapshot_id'],['../structparquet_1_1_active_data_file.html#a9bc85eb15dc4ee6f89693bb644ce6acb',1,'parquet::ActiveDataFile::snapshot_id']]],
+  ['sort_5forder_5fjson_14',['sort_order_json',['../structparquet_1_1_catalog_table_metadata.html#a61808bb24eaa59640af164e98b9fc16d',1,'parquet::CatalogTableMetadata']]],
+  ['stage_5fcreate_15',['stage_create',['../structparquet_1_1_catalog_create_table_request.html#a0dcde5b87ad673f091dbd5790be08e4f',1,'parquet::CatalogCreateTableRequest']]],
+  ['staged_5ffiles_16',['staged_files',['../structparquet_1_1_parquet_txn_state.html#a667491652277aa4f31d19cdf2e4f22bc',1,'parquet::ParquetTxnState']]],
+  ['status_17',['status',['../structparquet_1_1_catalog_load_table_result.html#a2b177d0cf63475ee2ee37ef950ead49a',1,'parquet::CatalogLoadTableResult::status'],['../structparquet_1_1_catalog_plan_scan_result.html#a63d37fa274291f05c60f823c5e372616',1,'parquet::CatalogPlanScanResult::status'],['../structparquet_1_1_head_object_result.html#a80f3d3c780f0e9be5093d70914c6f846',1,'parquet::HeadObjectResult::status'],['../structparquet_1_1_delete_object_result.html#ab842295ef9c922ce865d026fc097b85a',1,'parquet::DeleteObjectResult::status']]],
+  ['supports_5fcommit_5ftable_18',['supports_commit_table',['../structparquet_1_1_catalog_capability_set.html#afc511c8335b0ea4253d2b8c854af0c85',1,'parquet::CatalogCapabilitySet']]],
+  ['supports_5fcommit_5ftransaction_19',['supports_commit_transaction',['../structparquet_1_1_catalog_capability_set.html#a692fe133ee6031914dbb9cfa65925164',1,'parquet::CatalogCapabilitySet']]],
+  ['supports_5fcreate_5ftable_20',['supports_create_table',['../structparquet_1_1_catalog_capability_set.html#a2bfb8faee7accefba978e350348133a6',1,'parquet::CatalogCapabilitySet']]],
+  ['supports_5fregister_5ftable_21',['supports_register_table',['../structparquet_1_1_catalog_capability_set.html#a9eea814d47c666ce2fa2997afb8a838e',1,'parquet::CatalogCapabilitySet']]],
+  ['supports_5fscan_5fplanning_22',['supports_scan_planning',['../structparquet_1_1_catalog_capability_set.html#a9082e5cf4acf83b12ac90af5465f2f1d',1,'parquet::CatalogCapabilitySet']]]
+];

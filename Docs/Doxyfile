@@ -1,0 +1,48 @@
+# Doxyfile 1.17.0
+
+# Project configuration
+DOXYFILE_ENCODING      = UTF-8
+PROJECT_NAME           = "MariaDB Parquet Storage Engine"
+PROJECT_BRIEF          = "A MariaDB storage engine that enables querying Parquet files using DuckDB"
+
+# Output directory
+OUTPUT_DIRECTORY       = ./docs
+
+# Input files
+INPUT                  = ../storage/parquet/ha_parquet.h
+RECURSIVE              = YES
+FILE_PATTERNS          = *.h *.cc *.cpp
+
+# Enable preprocessing for MySQL/MariaDB macros
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = MYSQL_SERVER=1 \
+                         PLUGIN_VAR_RQCMDARG= \
+                         PLUGIN_VAR_READONLY= \
+                         PLUGIN_VAR_MEMALLOC= \
+                         MYF(x)= \
+                         PSI_NOT_INSTRUMENTED= \
+                         DBUG_ENTER(x)= \
+                         DBUG_RETURN(x)=return x \
+                         MY_RME=
+
+# Documentation extraction
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+
+# Output formats
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+
+# Diagrams
+HAVE_DOT               = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+UML_LOOK               = YES
+
+# Source browsing
+SOURCE_BROWSER         = YES
+VERBATIM_HEADERS       = YES
