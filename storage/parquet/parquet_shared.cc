@@ -8,6 +8,8 @@
 
 #include "log.h"
 
+#include <json.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <string>
@@ -25,6 +27,8 @@ char *parquet_s3_access_key_id = nullptr;
 char *parquet_s3_secret_access_key = nullptr;
 
 namespace {
+
+using json = nlohmann::json;
 
 std::string trim_copy(std::string value)
 {
@@ -104,6 +108,89 @@ std::string duckdb_s3_url_style(const std::string &url_style)
   }
 
   return "path";
+}
+
+std::string json_scalar_to_string(const json &value)
+{
+  if (value.is_string())
+    return value.get<std::string>();
+  if (value.is_number_integer())
+    return std::to_string(value.get<long long>());
+  if (value.is_number_unsigned())
+    return std::to_string(value.get<unsigned long long>());
+  return "";
+}
+
+uint64_t json_counter_value(const json &value)
+{
+  try {
+    if (value.is_string())
+      return static_cast<uint64_t>(std::stoull(value.get<std::string>()));
+    if (value.is_number_unsigned())
+      return value.get<uint64_t>();
+    if (value.is_number_integer()) {
+      const auto signed_value = value.get<long long>();
+      return signed_value > 0 ? static_cast<uint64_t>(signed_value) : 0;
+    }
+  } catch (const std::exception &) {
+  }
+  return 0;
+}
+
+bool snapshot_summary_has_data_files(const json &summary)
+{
+  if (!summary.is_object())
+    return false;
+
+  static const char *keys[] = {
+      "total-data-files",
+      "added-data-files",
+      "existing-data-files",
+  };
+  for (const char *key : keys) {
+    if (summary.contains(key) && json_counter_value(summary[key]) > 0)
+      return true;
+  }
+  return false;
+}
+
+bool current_snapshot_metadata_claims_data_files(
+    const parquet::TableMetadata &metadata)
+{
+  if (metadata.raw_catalog_metadata_json.empty())
+    return false;
+
+  try {
+    const auto payload = json::parse(metadata.raw_catalog_metadata_json);
+    const json *table_metadata = &payload;
+    if (payload.contains("metadata") && payload["metadata"].is_object())
+      table_metadata = &payload["metadata"];
+
+    std::string current_snapshot_id = metadata.current_snapshot_id;
+    if (current_snapshot_id.empty() &&
+        table_metadata->contains("current-snapshot-id")) {
+      current_snapshot_id =
+          json_scalar_to_string((*table_metadata)["current-snapshot-id"]);
+    }
+    if (current_snapshot_id.empty() || !table_metadata->contains("snapshots") ||
+        !(*table_metadata)["snapshots"].is_array()) {
+      return false;
+    }
+
+    for (const auto &snapshot : (*table_metadata)["snapshots"]) {
+      if (!snapshot.is_object() || !snapshot.contains("snapshot-id"))
+        continue;
+      if (json_scalar_to_string(snapshot["snapshot-id"]) !=
+          current_snapshot_id) {
+        continue;
+      }
+      return snapshot.contains("summary") &&
+             snapshot_summary_has_data_files(snapshot["summary"]);
+    }
+  } catch (const std::exception &) {
+  }
+
+  return false;
 }
 
 } // namespace
@@ -318,6 +405,16 @@ bool resolve_parquet_scan_paths(parquet::TableMetadata *metadata,
   *paths = extract_legacy_fake_manifest_list_scan_paths(
       metadata->raw_catalog_metadata_json);
   if (paths->empty()) {
+    if (current_snapshot_metadata_claims_data_files(*metadata)) {
+      if (error != nullptr) {
+        *error =
+            "Parquet sidecar is missing active file cache for a non-empty "
+            "Iceberg snapshot; catalog manifest scan reconstruction is not "
+            "implemented";
+      }
+      return false;
+    }
+
     // An empty Iceberg table with a snapshot but no data files is valid
     // (e.g. a newly created table where LakeKeeper issues an initial empty
     // snapshot). Return an empty path list so callers produce zero rows.

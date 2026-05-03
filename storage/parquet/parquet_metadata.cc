@@ -14,8 +14,6 @@ namespace
 
 using json = nlohmann::json;
 
-constexpr uint64_t PARQUET_DEFAULT_BLOCK_SIZE_BYTES = 16ULL * 1024ULL * 1024ULL;
-
 std::string TrimAsciiWhitespace(const std::string &value)
 {
   size_t begin = 0;
@@ -278,11 +276,6 @@ void FinalizeResolvedMetadata(parquet::TableMetadata *metadata)
 namespace parquet
 {
 
-TableOptions ResolveDefaultTableOptions()
-{
-  return {"latest", PARQUET_DEFAULT_BLOCK_SIZE_BYTES, "gzip"};
-}
-
 LocalPaths ResolveLocalPaths(const char *table_path)
 {
   LocalPaths paths;
@@ -537,7 +530,6 @@ bool ResolveCreateTableMetadata(const char *table_path,
   }
 
   TableMetadata resolved;
-  resolved.table_options = ResolveDefaultTableOptions();
   resolved.local_paths = ResolveLocalPaths(table_path);
   resolved.metadata_file_path = ResolveMetadataFilePath(table_path);
 
@@ -579,7 +571,6 @@ bool ResolveRuntimeTableMetadata(const char *table_path, TableMetadata *metadata
       return false;
     }
   } else {
-    resolved.table_options = ResolveDefaultTableOptions();
     resolved.local_paths = ResolveLocalPaths(table_path);
     resolved.metadata_file_path = metadata_path;
   }
@@ -788,10 +779,6 @@ bool SaveTableMetadata(const TableMetadata &metadata, std::string *error)
   }
 
   json payload;
-  payload["table_options"] = {
-      {"parquet_version", metadata.table_options.parquet_version},
-      {"block_size_bytes", metadata.table_options.block_size_bytes},
-      {"compression_codec", metadata.table_options.compression_codec}};
   payload["catalog_enabled"] = metadata.catalog_enabled;
   payload["object_store_enabled"] = metadata.object_store_enabled;
   payload["catalog"] = {
@@ -878,23 +865,6 @@ bool LoadTableMetadata(const char *table_path, TableMetadata *metadata,
     TableMetadata loaded;
     loaded.local_paths = ResolveLocalPaths(table_path);
     loaded.metadata_file_path = metadata_path;
-    loaded.table_options = ResolveDefaultTableOptions();
-
-    if (payload.contains("table_options")) {
-      const auto &table_options = payload["table_options"];
-      if (table_options.contains("parquet_version")) {
-        loaded.table_options.parquet_version =
-            table_options["parquet_version"].get<std::string>();
-      }
-      if (table_options.contains("block_size_bytes")) {
-        loaded.table_options.block_size_bytes =
-            table_options["block_size_bytes"].get<uint64_t>();
-      }
-      if (table_options.contains("compression_codec")) {
-        loaded.table_options.compression_codec =
-            table_options["compression_codec"].get<std::string>();
-      }
-    }
 
     loaded.catalog_enabled =
         payload.contains("catalog_enabled") &&

@@ -188,15 +188,6 @@ static void test_build_iceberg_schema_json()
      "shared schema builder maps MariaDB fields to Iceberg schema JSON");
 }
 
-static void test_default_table_options()
-{
-  auto options= parquet::ResolveDefaultTableOptions();
-  ok(options.parquet_version == "latest" &&
-     options.block_size_bytes == 16ULL * 1024ULL * 1024ULL &&
-     options.compression_codec == "gzip",
-     "default table options match Stage 1 local defaults");
-}
-
 static void test_local_path_resolution()
 {
   auto paths= parquet::ResolveLocalPaths("/tmp/test_db/users");
@@ -623,7 +614,6 @@ static void test_metadata_roundtrip()
   metadata.local_paths= parquet::ResolveLocalPaths("/tmp/users_roundtrip");
   metadata.metadata_file_path=
       parquet::ResolveMetadataFilePath(metadata.local_paths.table_path.c_str());
-  metadata.table_options= {"2.6", 8ULL * 1024ULL * 1024ULL, "zstd"};
   metadata.catalog_enabled= true;
   metadata.object_store_enabled= true;
   metadata.catalog_config.base_uri= "http://127.0.0.1:8181/catalog";
@@ -659,7 +649,6 @@ static void test_metadata_roundtrip()
   parquet::TableMetadata loaded;
   ok(parquet::LoadTableMetadata(metadata.local_paths.table_path.c_str(),
                                 &loaded, &error) &&
-         loaded.table_options.parquet_version == "2.6" &&
          loaded.object_store_enabled &&
          loaded.catalog_enabled &&
          loaded.catalog_table_ident.table_name == "users" &&
@@ -871,12 +860,14 @@ static void test_resolve_scan_paths_rejects_missing_lineage()
 {
   parquet::TableMetadata metadata;
   metadata.current_snapshot_id = "9";
+  metadata.raw_catalog_metadata_json =
+      R"json({"current-snapshot-id":9,"snapshots":[{"snapshot-id":9,"summary":{"operation":"append","total-data-files":"1","total-records":"3"},"manifest-list":"s3://warehouse/db/t1/metadata/snap-9.avro"}]})json";
 
   std::vector<std::string> paths;
   std::string error;
   ok(!resolve_parquet_scan_paths(&metadata, &paths, &error) &&
-         error.find("lacks scan lineage") != std::string::npos,
-     "scan path resolver rejects current snapshots without sidecar lineage");
+         error.find("missing active file cache") != std::string::npos,
+     "scan path resolver rejects non-empty snapshots without sidecar lineage");
 }
 
 static void test_create_cleanup_removes_local_artifacts()
@@ -990,14 +981,13 @@ static void test_build_iceberg_commit_artifacts()
 
 int main()
 {
-  plan(56);
+  plan(55);
 
   test_build_query_basic_schema();
   test_build_query_blob_mapping();
   test_build_query_bit_mapping();
   test_store_duckdb_boolean_in_bit_field();
   test_build_iceberg_schema_json();
-  test_default_table_options();
   test_local_path_resolution();
   test_staged_file_helpers();
   test_transaction_state_validation();

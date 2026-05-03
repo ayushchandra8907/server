@@ -12,12 +12,6 @@
 namespace parquet
 {
 
-struct TableOptions {
-  std::string parquet_version;
-  uint64_t block_size_bytes;
-  std::string compression_codec;
-};
-
 struct LocalPaths {
   std::string table_path;
   std::string table_name;
@@ -36,7 +30,6 @@ struct ActiveDataFile {
 };
 
 struct TableMetadata {
-  TableOptions table_options;
   LocalPaths local_paths;
   bool catalog_enabled = false;
   bool object_store_enabled = false;
@@ -53,7 +46,6 @@ struct TableMetadata {
   std::vector<std::string> active_scan_paths;
 };
 
-TableOptions ResolveDefaultTableOptions();
 LocalPaths ResolveLocalPaths(const char *table_path);
 std::string ResolveMetadataFilePath(const char *table_path);
 bool MetadataSidecarExists(const char *table_path);
