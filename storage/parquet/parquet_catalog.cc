@@ -268,6 +268,9 @@ HttpResponse ExecuteRequest(const CatalogClientConfig &config,
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+  if (method == "HEAD") {
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+  }
 
   ApplyCommonCurlOptions(curl, config, &response);
 
